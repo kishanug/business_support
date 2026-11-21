@@ -1,0 +1,6 @@
+{
+  "name": "AgencyOS",
+  "description": "Mobile-first operations system for managing member requests, chapters, locations, registered substitutes, partner guest delegation, attendance check-ins, and automated receivables/payables reconciliation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
