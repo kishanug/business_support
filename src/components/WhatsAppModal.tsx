@@ -68,16 +68,16 @@ export const WhatsAppModal: React.FC<WhatsAppModalProps> = ({ draft, onClose, on
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-[#142342]/45 backdrop-blur-[2px] flex items-end sm:items-center justify-center p-0 sm:p-4"
+      className="fixed inset-0 z-50 bg-black/70 backdrop-blur-[2px] flex items-end sm:items-center justify-center p-0 sm:p-4"
       role="dialog"
       aria-modal="true"
       aria-label={draft.title}
     >
-      <div className="w-full sm:max-w-lg bg-white rounded-t-2xl sm:rounded-2xl border border-[#E6E8EF] max-h-[90vh] flex flex-col overflow-hidden">
-        <div className="px-5 py-4 border-b border-[#E6E8EF] flex items-center justify-between gap-3">
+      <div className="w-full sm:max-w-lg bg-[#18181a] rounded-t-lg sm:rounded-lg border border-[#f2efeb]/10 max-h-[90vh] flex flex-col overflow-hidden">
+        <div className="px-5 py-4 border-b border-[#f2efeb]/10 flex items-center justify-between gap-3">
           <div className="min-w-0">
-            <h3 className="font-display text-base font-bold text-[#142342] truncate">{draft.title}</h3>
-            <p className="text-xs text-[#64748B] truncate mt-0.5">
+            <h3 className="font-display text-base font-bold text-[#f2efeb] truncate">{draft.title}</h3>
+            <p className="text-xs text-[#f2efeb]/60 truncate mt-0.5">
               {draft.recipientLabel} · {draft.recipientPhone}
             </p>
           </div>
@@ -85,17 +85,17 @@ export const WhatsAppModal: React.FC<WhatsAppModalProps> = ({ draft, onClose, on
             type="button"
             aria-label="Close message drawer"
             onClick={onClose}
-            className="w-9 h-9 rounded-lg flex items-center justify-center text-[#64748B] hover:bg-[#F8F7FC] hover:text-[#142342] shrink-0"
+            className="w-9 h-9 rounded-lg flex items-center justify-center text-[#f2efeb]/60 hover:bg-[#18181a]/[0.05] hover:text-[#f2efeb] shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
         <div className="p-5 overflow-y-auto space-y-4">
-          <div className="flex items-center justify-between text-xs text-[#475569] bg-[#F8F7FC] px-3.5 py-2.5 rounded-xl border border-[#E6E8EF]">
+          <div className="flex items-center justify-between text-xs text-[#f2efeb]/70 bg-[#1f1f23] px-3.5 py-2.5 rounded-[6px] border border-[#f2efeb]/10">
             <span>
               Delivery status:{' '}
-              <strong className="text-[#142342]">
+              <strong className="text-[#f2efeb]">
                 {deliveryState === 'PREPARED'
                   ? 'Prepared (not sent yet)'
                   : deliveryState === 'OPENED'
@@ -106,7 +106,7 @@ export const WhatsAppModal: React.FC<WhatsAppModalProps> = ({ draft, onClose, on
           </div>
 
           <div>
-            <label htmlFor="wa-draft-body" className="block text-xs font-semibold text-[#142342] mb-1.5">
+            <label htmlFor="wa-draft-body" className="block text-xs font-semibold text-[#f2efeb] mb-1.5">
               Editable Message Draft
             </label>
             <textarea
@@ -114,29 +114,29 @@ export const WhatsAppModal: React.FC<WhatsAppModalProps> = ({ draft, onClose, on
               rows={6}
               value={body}
               onChange={(e) => setBody(e.target.value)}
-              className="w-full p-3.5 rounded-xl border border-[#E6E8EF] text-sm text-[#142342] leading-relaxed focus:outline-none focus:border-[#6D28D9] focus:ring-2 focus:ring-[#F3E8FF]"
+              className="w-full p-3.5 rounded-[6px] border border-[#f2efeb]/10 text-sm text-[#f2efeb] leading-relaxed focus:outline-none focus:border-[#C81E2B] focus:ring-2 focus:ring-[#C81E2B]/35"
             />
-            <p className="text-[11px] text-[#64748B] mt-1.5">
+            <p className="text-[11px] text-[#f2efeb]/60 mt-1.5">
               Opening WhatsApp prepares a pre-filled draft on your device. It does not auto-send or guarantee delivery; mark sent manually after confirming in WhatsApp.
             </p>
           </div>
         </div>
 
-        <div className="px-5 py-4 border-t border-[#E6E8EF] bg-[#F8F7FC] flex flex-wrap items-center gap-2 justify-between">
+        <div className="px-5 py-4 border-t border-[#f2efeb]/10 bg-[#1f1f23] flex flex-wrap items-center gap-2 justify-between">
           <div className="flex items-center gap-2">
             <a
               href={telHref}
-              className="h-10 px-3 rounded-xl border border-[#E6E8EF] bg-white hover:bg-[#F3E8FF]/40 text-xs font-semibold text-[#142342] inline-flex items-center gap-1.5 whitespace-nowrap"
+              className="h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 bg-[#18181a] hover:bg-[#C81E2B]/20 text-xs font-semibold text-[#f2efeb] inline-flex items-center gap-1.5 whitespace-nowrap"
             >
-              <Phone className="w-3.5 h-3.5 text-[#142342]" />
+              <Phone className="w-3.5 h-3.5 text-[#f2efeb]" />
               Call
             </a>
             <button
               type="button"
               onClick={handleCopy}
-              className="h-10 px-3 rounded-xl border border-[#E6E8EF] bg-white hover:bg-[#F3E8FF]/40 text-xs font-semibold text-[#142342] inline-flex items-center gap-1.5 whitespace-nowrap"
+              className="h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 bg-[#18181a] hover:bg-[#C81E2B]/20 text-xs font-semibold text-[#f2efeb] inline-flex items-center gap-1.5 whitespace-nowrap"
             >
-              {copied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+              {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
               {copied ? 'Copied' : 'Copy'}
             </button>
           </div>
@@ -147,7 +147,7 @@ export const WhatsAppModal: React.FC<WhatsAppModalProps> = ({ draft, onClose, on
               target="_blank"
               rel="noreferrer"
               onClick={() => recordState('OPENED')}
-              className="h-10 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap"
+              className="h-10 px-4 rounded-[6px] bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap"
             >
               <MessageCircle className="w-3.5 h-3.5" />
               Open WhatsApp
@@ -156,7 +156,7 @@ export const WhatsAppModal: React.FC<WhatsAppModalProps> = ({ draft, onClose, on
             <button
               type="button"
               onClick={() => recordState('MANUALLY_SENT')}
-              className="h-10 px-3.5 rounded-xl bg-[#6D28D9] hover:bg-[#5B21B6] text-white text-xs font-semibold whitespace-nowrap"
+              className="h-10 px-3.5 rounded-[6px] bg-[#C81E2B] hover:bg-[#A31621] text-white text-xs font-semibold whitespace-nowrap"
             >
               Mark Sent
             </button>

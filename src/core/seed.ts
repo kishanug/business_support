@@ -23,8 +23,8 @@ import type {
   Substitute,
   SubstituteEarning,
   UserAccount,
-} from './types';
-import { getTodayInKolkata, getTomorrowInKolkata, getYesterdayInKolkata } from './rules';
+} from './types.ts';
+import { getTodayInKolkata, getTomorrowInKolkata, getYesterdayInKolkata } from './rules.ts';
 
 export interface DomainDataset {
   users: UserAccount[];
@@ -927,6 +927,8 @@ export function createDemoDataset(referenceDate: Date = new Date()): DomainDatas
       startTime: opts?.startTime ?? chapter.startTime,
       endTime: opts?.endTime ?? chapter.endTime,
       intro30SecSnapshot: opts?.intro30SecSnapshot ?? member.intro30Sec,
+      memberNoteType: opts?.memberNoteType,
+      referralAskSnapshot: opts?.referralAskSnapshot,
       memberNameSnapshot: member.name,
       memberBusinessSnapshot: member.businessName,
       memberPhoneSnapshot: member.phone,
@@ -952,6 +954,8 @@ export function createDemoDataset(referenceDate: Date = new Date()): DomainDatas
     mkReq('req-tmrw-1', 101, 'mem-amit', tomorrow, 'MULTI_INTEREST', 'CONFIRMED', {
       receivedFromType: 'DIRECT_MEMBER',
       receivedFrom: 'Phone call from Amit Patel',
+      memberNoteType: 'REFERRAL_ROUND',
+      referralAskSnapshot: 'Please ask for a warm intro to commercial leasing brokers or founders renovating 5,000+ sq ft offices in Andheri/BKC.',
     }),
     mkReq('req-tmrw-2', 102, 'mem-arjun', tomorrow, 'MULTI_INTEREST', 'CONFIRMED', {
       // Example: External Coordinator Priya sourced the request; Super Admin Kishan operates it!

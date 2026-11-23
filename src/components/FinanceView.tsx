@@ -1,21 +1,25 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
+  ArrowDownRight,
+  ArrowUpDown,
+  ArrowUpRight,
   Award,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   Filter,
-  IndianRupee,
   MessageCircle,
-  Phone,
   Search,
+  Sparkles,
+  TrendingUp,
   X,
 } from 'lucide-react';
 import { api, ApiError, type AdminBootstrapData } from '../lib/api';
 import type { FinanceFilterIntent } from '../App';
 import {
   autoAllocateAmount,
-  buildTelHref,
+  buildMemberReminderWhatsAppText,
+  buildPayoutSummaryWhatsAppText,
   computeFinanceSummary,
   formatINR,
   formatShortDate,
@@ -35,9 +39,10 @@ interface FinanceViewProps {
   onOpenDraft: (draft: DraftMessageConfig) => void;
 }
 
-type FinanceTab = 'receipts' | 'payments' | 'commissions' | 'ledger';
+type FinanceTab = 'receivables' | 'payables' | 'receipts_log' | 'payouts_log' | 'commissions';
 type DatePreset = 'ALL' | 'TODAY_TMRW' | 'WEEK' | 'MONTH' | 'CUSTOM';
 type PayStatusFilter = 'ALL' | 'OUTSTANDING' | 'SETTLED' | 'ON_HOLD';
+type FinanceSortBy = 'OUTSTANDING_DESC' | 'TOTAL_DESC' | 'DATE_DESC' | 'NAME_ASC';
 
 function addDays(iso: string, delta: number): string {
   const [y, m, d] = iso.split('-').map(Number);
@@ -52,11 +57,15 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
   onOpenDraft,
 }) => {
   const isAdmin = data.actor.role === 'SUPER_ADMIN';
-  const [tab, setTab] = useState<FinanceTab>('receipts');
-  const [expandedGroup, setExpandedGroup] = useState<Record<string, boolean>>({});
-  const [filtersOpen, setFiltersOpen] = useState(true);
+  const [tab, setTab] = useState<FinanceTab>('receivables');
+  const [expandedChapter, setExpandedChapter] = useState<Record<string, boolean>>({});
+  const [expandedPayableChapter, setExpandedPayableChapter] = useState<Record<string, boolean>>({});
+  const [groupReceivablesByChapter, setGroupReceivablesByChapter] = useState(true);
+  const [groupPayablesByChapter, setGroupPayablesByChapter] = useState(true);
+  const [filtersOpen, setFiltersOpen] = useState(false);
 
-  // Comprehensive Finance filters
+  // Comprehensive Finance filters + Sort By (shared cleanly across Receivables & Payables)
+  const [sortBy, setSortBy] = useState<FinanceSortBy>('OUTSTANDING_DESC');
   const [datePreset, setDatePreset] = useState<DatePreset>('ALL');
   const [dateBasis, setDateBasis] = useState<'MEETING_DATE' | 'PAYMENT_DATE'>('MEETING_DATE');
   const [customStart, setCustomStart] = useState(addDays(data.today, -30));
@@ -71,7 +80,12 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
 
   useEffect(() => {
     if (!filterIntent) return;
-    if (filterIntent.tab) setTab(filterIntent.tab);
+    if (filterIntent.tab) {
+      if (filterIntent.tab === 'receipts') setTab('receivables');
+      else if (filterIntent.tab === 'payments') setTab('payables');
+      else if (filterIntent.tab === 'ledger') setTab('receipts_log');
+      else if (filterIntent.tab === 'commissions') setTab('commissions');
+    }
     if (filterIntent.status) setStatusFilter(filterIntent.status);
     if (filterIntent.viaCoordinatorId !== undefined) {
       setViaCoordFilter(filterIntent.viaCoordinatorId || 'ALL');
@@ -311,44 +325,101 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
     setSearch('');
   }
 
-  // Group filtered charges by Member
+  // Group filtered charges by Member with Sort By support
   const memberGroups = useMemo(() => {
     const map = new Map<
       string,
       {
         memberId: string;
         memberName: string;
+        chapterName: string;
         phone: string;
         whatsapp: string;
         charges: ClientCharge[];
+        totalBilled: number;
         outstanding: number;
         unpaidCount: number;
+        latestDate: string;
       }
     >();
     for (const chg of filteredCharges) {
       const m = data.members.find((x) => x.id === chg.memberId);
+      const chapterName =
+        chg.chapterName ||
+        (m ? data.chapters.find((ch) => ch.id === m.chapterId)?.name : undefined) ||
+        'Unassigned Chapter';
       let g = map.get(chg.memberId);
       if (!g) {
         g = {
           memberId: chg.memberId,
           memberName: m?.name ?? 'Member',
+          chapterName,
           phone: m?.phone ?? '',
           whatsapp: m?.whatsappPhone || m?.phone || '',
           charges: [],
+          totalBilled: 0,
           outstanding: 0,
           unpaidCount: 0,
+          latestDate: chg.meetingDate,
         };
         map.set(chg.memberId, g);
       }
       g.charges.push(chg);
+      g.totalBilled += chg.amount;
       const rem = Math.max(0, chg.amount - chg.receivedAmount);
       g.outstanding += rem;
       if (rem > 0) g.unpaidCount += 1;
+      if (chg.meetingDate > g.latestDate) g.latestDate = chg.meetingDate;
     }
-    return Array.from(map.values()).sort((a, b) => b.outstanding - a.outstanding);
-  }, [filteredCharges, data.members]);
+    const list = Array.from(map.values()).map((g) => ({
+      ...g,
+      charges: [...g.charges].sort((a, b) => b.meetingDate.localeCompare(a.meetingDate)),
+    }));
+    return list.sort((a, b) => {
+      if (sortBy === 'TOTAL_DESC') return b.totalBilled - a.totalBilled;
+      if (sortBy === 'DATE_DESC') return b.latestDate.localeCompare(a.latestDate);
+      if (sortBy === 'NAME_ASC') return a.memberName.localeCompare(b.memberName);
+      return b.outstanding - a.outstanding || b.totalBilled - a.totalBilled;
+    });
+  }, [filteredCharges, data.members, data.chapters, sortBy]);
 
-  // Group filtered earnings by Registered Substitute / Partner Payee ONLY
+  // Group member cards cleanly under collapsible Chapter dropdown sections
+  const receivablesByChapter = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        chapterName: string;
+        members: typeof memberGroups;
+        totalBilled: number;
+        totalOutstanding: number;
+        meetingCount: number;
+      }
+    >();
+    for (const m of memberGroups) {
+      let bucket = map.get(m.chapterName);
+      if (!bucket) {
+        bucket = {
+          chapterName: m.chapterName,
+          members: [],
+          totalBilled: 0,
+          totalOutstanding: 0,
+          meetingCount: 0,
+        };
+        map.set(m.chapterName, bucket);
+      }
+      bucket.members.push(m);
+      bucket.totalBilled += m.totalBilled;
+      bucket.totalOutstanding += m.outstanding;
+      bucket.meetingCount += m.charges.length;
+    }
+    return Array.from(map.values()).sort((a, b) => {
+      if (sortBy === 'NAME_ASC') return a.chapterName.localeCompare(b.chapterName);
+      if (sortBy === 'TOTAL_DESC') return b.totalBilled - a.totalBilled;
+      return b.totalOutstanding - a.totalOutstanding || b.totalBilled - a.totalBilled;
+    });
+  }, [memberGroups, sortBy]);
+
+  // Group filtered earnings by Veloctive Team / Partner Payee ONLY with Sort By support
   const substituteGroups = useMemo(() => {
     const map = new Map<
       string,
@@ -359,9 +430,11 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
         whatsapp: string;
         upiReference?: string;
         earnings: SubstituteEarning[];
+        totalEarned: number;
         outstanding: number;
         unpaidCount: number;
         bonusesTotal: number;
+        latestDate: string;
       }
     >();
     for (const earn of filteredEarnings) {
@@ -373,24 +446,131 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
           .reduce((acc, b) => acc + b.amount, 0);
         g = {
           substituteId: earn.payeeSubstituteId,
-          substituteName: s?.name ?? 'Registered Substitute',
+          substituteName: s?.name ?? 'Veloctive Team',
           phone: s?.phone ?? '',
           whatsapp: s?.whatsappPhone || s?.phone || '',
           upiReference: s?.upiReference,
           earnings: [],
+          totalEarned: 0,
           outstanding: 0,
           unpaidCount: 0,
           bonusesTotal: bonusSum,
+          latestDate: earn.meetingDate,
         };
         map.set(earn.payeeSubstituteId, g);
       }
       g.earnings.push(earn);
+      g.totalEarned += earn.amount;
       const rem = Math.max(0, earn.amount - earn.paidAmount);
       g.outstanding += rem;
       if (rem > 0) g.unpaidCount += 1;
+      if (earn.meetingDate > g.latestDate) g.latestDate = earn.meetingDate;
     }
-    return Array.from(map.values()).sort((a, b) => b.outstanding - a.outstanding);
-  }, [filteredEarnings, data.substitutes, data.appreciationBonuses]);
+    const list = Array.from(map.values()).map((g) => ({
+      ...g,
+      earnings: [...g.earnings].sort((a, b) => b.meetingDate.localeCompare(a.meetingDate)),
+    }));
+    return list.sort((a, b) => {
+      if (sortBy === 'TOTAL_DESC') return b.totalEarned - a.totalEarned;
+      if (sortBy === 'DATE_DESC') return b.latestDate.localeCompare(a.latestDate);
+      if (sortBy === 'NAME_ASC') return a.substituteName.localeCompare(b.substituteName);
+      return b.outstanding - a.outstanding || b.totalEarned - a.totalEarned;
+    });
+  }, [filteredEarnings, data.substitutes, data.appreciationBonuses, sortBy]);
+
+  // Group filtered payables cleanly by Chapter -> Substitute (SS #4: By chapter | By substitute)
+  const payablesByChapter = useMemo(() => {
+    const chapterMap = new Map<
+      string,
+      {
+        chapterName: string;
+        substitutesMap: Map<
+          string,
+          {
+            substituteId: string;
+            substituteName: string;
+            whatsapp: string;
+            earnings: SubstituteEarning[];
+            totalEarned: number;
+            outstanding: number;
+            bonusesTotal: number;
+            latestDate: string;
+          }
+        >;
+        totalEarned: number;
+        totalOutstanding: number;
+        meetingCount: number;
+      }
+    >();
+
+    for (const earn of filteredEarnings) {
+      const chName = earn.chapterName || 'Unassigned Chapter';
+      let chBucket = chapterMap.get(chName);
+      if (!chBucket) {
+        chBucket = {
+          chapterName: chName,
+          substitutesMap: new Map(),
+          totalEarned: 0,
+          totalOutstanding: 0,
+          meetingCount: 0,
+        };
+        chapterMap.set(chName, chBucket);
+      }
+
+      const s = data.substitutes.find((x) => x.id === earn.payeeSubstituteId);
+      let subBucket = chBucket.substitutesMap.get(earn.payeeSubstituteId);
+      if (!subBucket) {
+        const bonusSum = data.appreciationBonuses
+          .filter((b) => b.payeeSubstituteId === earn.payeeSubstituteId)
+          .reduce((acc, b) => acc + b.amount, 0);
+        subBucket = {
+          substituteId: earn.payeeSubstituteId,
+          substituteName: s?.name ?? 'Veloctive Team',
+          whatsapp: s?.whatsappPhone || s?.phone || '',
+          earnings: [],
+          totalEarned: 0,
+          outstanding: 0,
+          bonusesTotal: bonusSum,
+          latestDate: earn.meetingDate,
+        };
+        chBucket.substitutesMap.set(earn.payeeSubstituteId, subBucket);
+      }
+
+      subBucket.earnings.push(earn);
+      subBucket.totalEarned += earn.amount;
+      const rem = Math.max(0, earn.amount - earn.paidAmount);
+      subBucket.outstanding += rem;
+      if (earn.meetingDate > subBucket.latestDate) subBucket.latestDate = earn.meetingDate;
+
+      chBucket.totalEarned += earn.amount;
+      chBucket.totalOutstanding += rem;
+      chBucket.meetingCount += 1;
+    }
+
+    return Array.from(chapterMap.values())
+      .map((ch) => ({
+        chapterName: ch.chapterName,
+        totalEarned: ch.totalEarned,
+        totalOutstanding: ch.totalOutstanding,
+        meetingCount: ch.meetingCount,
+        substitutes: Array.from(ch.substitutesMap.values())
+          .map((sub) => ({
+            ...sub,
+            earnings: [...sub.earnings].sort((a, b) => b.meetingDate.localeCompare(a.meetingDate)),
+          }))
+          .sort((a, b) => {
+            if (sortBy === 'TOTAL_DESC') return b.totalEarned - a.totalEarned;
+            if (sortBy === 'DATE_DESC') return b.latestDate.localeCompare(a.latestDate);
+            if (sortBy === 'NAME_ASC') return a.substituteName.localeCompare(b.substituteName);
+            return b.outstanding - a.outstanding || b.totalEarned - a.totalEarned;
+          }),
+      }))
+      .sort((a, b) => {
+        if (sortBy === 'NAME_ASC') return a.chapterName.localeCompare(b.chapterName);
+        if (sortBy === 'TOTAL_DESC') return b.totalEarned - a.totalEarned;
+        return b.totalOutstanding - a.totalOutstanding || b.totalEarned - a.totalEarned;
+      });
+  }, [filteredEarnings, data.substitutes, data.appreciationBonuses, sortBy]);
 
   function openReceiptModal(memberId: string) {
     setError(null);
@@ -510,7 +690,7 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
       });
       await onRefresh();
       setPayoutSubId(null);
-      setNotice('Substitute payout recorded and allocated cleanly.');
+      setNotice('Veloctive Team payout recorded and allocated cleanly.');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Failed to record payout.');
     } finally {
@@ -543,7 +723,7 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
   return (
     <div className="space-y-5">
       {notice && (
-        <div role="status" className="px-4 py-2.5 rounded-xl bg-[#F3E8FF] border border-[#DDD6FE] text-xs font-medium text-[#5B21B6] flex items-center justify-between gap-2">
+        <div role="status" className="px-4 py-2.5 rounded-[6px] bg-[#C81E2B]/20 border border-[#E12D39]/40 text-xs font-medium text-[#F5DFA0] flex items-center justify-between gap-2">
           <span>{notice}</span>
           <button type="button" onClick={() => setNotice(null)} className="font-semibold cursor-pointer">
             Dismiss
@@ -551,562 +731,1084 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
         </div>
       )}
 
-      {/* Segmented Receipts | Payments | Commissions | Ledger Tabs */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-1 p-1 rounded-xl bg-[#F8F7FC] border border-[#E6E8EF]">
-        {(
-          [
-            { id: 'receipts', label: `Receipts (${filteredCharges.filter((c) => c.amount > c.receivedAmount).length})` },
-            { id: 'payments', label: `Payments (${filteredEarnings.filter((e) => e.amount > e.paidAmount).length})` },
-            { id: 'commissions', label: `Commissions (${filteredCommissions.length})` },
-            { id: 'ledger', label: 'Ledger' },
-          ] as Array<{ id: FinanceTab; label: string }>
-        ).map((t) => (
-          <button
-            key={t.id}
-            type="button"
-            onClick={() => setTab(t.id)}
-            className={`h-10 rounded-lg text-xs sm:text-sm font-semibold whitespace-nowrap transition-colors cursor-pointer ${
-              tab === t.id ? 'bg-[#142342] text-white' : 'text-[#475569] hover:text-[#142342]'
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
+      {/* Top 4 KPI Cards matching SS #4: TO RECEIVE | TO PAY | GROSS MARGIN | BONUS (AGENCY) */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <button
+          type="button"
+          onClick={() => {
+            setTab('receivables');
+            setStatusFilter('OUTSTANDING');
+          }}
+          className={`p-4 rounded-xl border bg-[#18181a] text-left cursor-pointer transition-colors ${
+            tab === 'receivables'
+              ? 'border-[#C81E2B]/65'
+              : 'border-[#f2efeb]/10 hover:border-[#C81E2B]/45'
+          }`}
+        >
+          <div className="w-7 h-7 rounded-lg bg-emerald-500/14 text-emerald-400 flex items-center justify-center mb-3">
+            <ArrowUpRight className="w-4 h-4" />
+          </div>
+          <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-[#f2efeb]/55">
+            To Receive
+          </p>
+          <p className="font-display text-xl font-bold tracking-tight text-emerald-400 mt-0.5 tabular-nums">
+            {formatINR(summary.receivablesOutstanding)}
+          </p>
+          <p className="text-[11px] text-[#f2efeb]/45 mt-0.5 tabular-nums">
+            Received {formatINR(summary.cashReceived)}
+          </p>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
+            setTab('payables');
+            setStatusFilter('OUTSTANDING');
+          }}
+          className={`p-4 rounded-xl border bg-[#18181a] text-left cursor-pointer transition-colors ${
+            tab === 'payables'
+              ? 'border-[#C81E2B]/65'
+              : 'border-[#f2efeb]/10 hover:border-[#C81E2B]/45'
+          }`}
+        >
+          <div className="w-7 h-7 rounded-lg bg-[#C81E2B]/14 text-[#E12D39] flex items-center justify-center mb-3">
+            <ArrowDownRight className="w-4 h-4" />
+          </div>
+          <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-[#f2efeb]/55">
+            To Pay
+          </p>
+          <p className="font-display text-xl font-bold tracking-tight text-[#E12D39] mt-0.5 tabular-nums">
+            {formatINR(summary.payablesOutstanding)}
+          </p>
+          <p className="text-[11px] text-[#f2efeb]/45 mt-0.5 tabular-nums">
+            Paid {formatINR(summary.cashPaidToSubstitutes)}
+          </p>
+        </button>
+
+        <div className="p-4 rounded-xl border border-[#f2efeb]/10 bg-[#18181a]">
+          <div className="w-7 h-7 rounded-lg bg-[#C81E2B]/12 text-[#E12D39] flex items-center justify-center mb-3">
+            <TrendingUp className="w-4 h-4" />
+          </div>
+          <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-[#f2efeb]/55">
+            Gross Margin
+          </p>
+          <p className="font-display text-xl font-bold tracking-tight text-[#f2efeb] mt-0.5 tabular-nums">
+            {formatINR(summary.grossMarginBeforeBonus)}
+          </p>
+          <p className="text-[11px] text-[#f2efeb]/45 mt-0.5 tabular-nums">
+            Net {formatINR(summary.contributionAfterBonus)}
+          </p>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => setTab('payouts_log')}
+          className="p-4 rounded-xl border border-[#f2efeb]/10 hover:border-[#E2B340]/45 bg-[#18181a] text-left cursor-pointer transition-colors"
+        >
+          <div className="w-7 h-7 rounded-lg bg-[#E2B340]/14 text-[#E2B340] flex items-center justify-center mb-3">
+            <Sparkles className="w-4 h-4" />
+          </div>
+          <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-[#f2efeb]/55">
+            Bonus (Agency)
+          </p>
+          <p className="font-display text-xl font-bold tracking-tight text-[#E2B340] mt-0.5 tabular-nums">
+            {formatINR(summary.agencyBonusPaid)}
+          </p>
+          <p className="text-[11px] text-[#f2efeb]/45 mt-0.5 tabular-nums">
+            Appreciation rewards
+          </p>
+        </button>
       </div>
 
-      {/* Comprehensive Finance Filter Bar */}
-      <div className="rounded-xl border border-[#E6E8EF] bg-[#F8F7FC]/70 overflow-hidden">
-        <div className="px-3.5 py-2.5 flex items-center justify-between gap-2 border-b border-[#E6E8EF]/80">
-          <button
-            type="button"
-            onClick={() => setFiltersOpen((o) => !o)}
-            className="text-xs font-semibold text-[#142342] inline-flex items-center gap-1.5 cursor-pointer"
-          >
-            <Filter className="w-3.5 h-3.5 text-[#6D28D9]" />
-            Finance Filters
-            {hasActiveFilters && <span className="text-[#6D28D9]">· Active</span>}
-            {filtersOpen ? <ChevronUp className="w-3.5 h-3.5 text-[#64748B]" /> : <ChevronDown className="w-3.5 h-3.5 text-[#64748B]" />}
-          </button>
-          {hasActiveFilters && (
+      {/* Clean Segmented Tabs matching SS #4: Receivables | Payables | Receipts | Payouts (+ Commissions) */}
+      <div className="flex flex-wrap items-center gap-2" role="tablist" aria-label="Finance views">
+        {(
+          [
+            { id: 'receivables', label: 'Receivables' },
+            { id: 'payables', label: 'Payables' },
+            { id: 'receipts_log', label: 'Receipts' },
+            { id: 'payouts_log', label: 'Payouts' },
+            ...(isAdmin || filteredCommissions.length > 0
+              ? [{ id: 'commissions' as FinanceTab, label: 'Commissions' }]
+              : []),
+          ] as Array<{ id: FinanceTab; label: string }>
+        ).map((t) => {
+          const active = tab === t.id;
+          return (
             <button
+              key={t.id}
               type="button"
-              onClick={resetAllFilters}
-              className="text-xs font-semibold text-[#6D28D9] hover:underline cursor-pointer"
+              role="tab"
+              aria-selected={active}
+              onClick={() => setTab(t.id)}
+              className={`h-9 px-4 rounded-xl text-xs sm:text-[13px] font-semibold whitespace-nowrap transition-colors cursor-pointer ${
+                active
+                  ? 'bg-[#C81E2B] text-white border border-[#C81E2B]'
+                  : 'bg-[#18181a] text-[#f2efeb]/80 border border-[#f2efeb]/12 hover:border-[#C81E2B]/50 hover:text-[#f2efeb]'
+              }`}
             >
-              Reset All
+              {t.label}
             </button>
+          );
+        })}
+      </div>
+
+      {/* Clean Single-Row Filter Strip matching SS #4 (Chapter, Sort, Only outstanding, By chapter / By member or By substitute + More Filters) */}
+      <div className="p-3 rounded-xl border border-[#f2efeb]/10 bg-[#18181a] flex flex-wrap items-center justify-between gap-2.5">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-[#f2efeb]/60 pr-1">
+            <Filter className="w-3.5 h-3.5" />
+            Filters
+          </span>
+
+          <select
+            aria-label="Filter finance by chapter"
+            data-testid="finance-chapter-select"
+            value={chapterFilter}
+            onChange={(e) => setChapterFilter(e.target.value)}
+            className="h-9 px-3 rounded-lg border border-[#f2efeb]/12 bg-[#111113] text-xs font-medium text-[#f2efeb] focus:outline-none focus:border-[#C81E2B]"
+          >
+            <option value="ALL">All chapters</option>
+            {data.chapters.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+
+          <div className="relative inline-flex items-center">
+            <ArrowUpDown className="w-3.5 h-3.5 text-[#E2B340] absolute left-2.5 pointer-events-none" />
+            <select
+              aria-label="Sort receivables and payables"
+              data-testid="finance-sort-select"
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as FinanceSortBy)}
+              className="h-9 pl-8 pr-3 rounded-lg border border-[#f2efeb]/12 bg-[#111113] text-xs font-medium text-[#f2efeb] focus:outline-none focus:border-[#C81E2B]"
+            >
+              <option value="OUTSTANDING_DESC">Outstanding ↓</option>
+              <option value="TOTAL_DESC">Billed / Earned ↓</option>
+              <option value="DATE_DESC">Latest date ↓</option>
+              <option value="NAME_ASC">Name (A → Z)</option>
+            </select>
+          </div>
+
+          <label className="h-9 px-3 rounded-lg border border-[#f2efeb]/12 bg-[#111113] inline-flex items-center gap-2 text-xs font-medium text-[#f2efeb]/80 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              data-testid="finance-only-outstanding-checkbox"
+              checked={statusFilter === 'OUTSTANDING'}
+              onChange={(e) => setStatusFilter(e.target.checked ? 'OUTSTANDING' : 'ALL')}
+              className="accent-[#C81E2B]"
+            />
+            <span>Only outstanding</span>
+          </label>
+
+          {tab === 'receivables' && (
+            <div
+              className="inline-flex items-center p-0.5 rounded-lg border border-[#f2efeb]/12 bg-[#111113]"
+              role="group"
+              aria-label="Receivables grouping"
+            >
+              <button
+                type="button"
+                data-testid="receivables-by-chapter-btn"
+                onClick={() => setGroupReceivablesByChapter(true)}
+                className={`h-8 px-3 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                  groupReceivablesByChapter
+                    ? 'bg-[#C81E2B] text-white'
+                    : 'text-[#f2efeb]/70 hover:text-[#f2efeb]'
+                }`}
+              >
+                By chapter
+              </button>
+              <button
+                type="button"
+                data-testid="receivables-by-member-btn"
+                onClick={() => setGroupReceivablesByChapter(false)}
+                className={`h-8 px-3 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                  !groupReceivablesByChapter
+                    ? 'bg-[#C81E2B] text-white'
+                    : 'text-[#f2efeb]/70 hover:text-[#f2efeb]'
+                }`}
+              >
+                By member
+              </button>
+            </div>
+          )}
+
+          {tab === 'payables' && (
+            <div
+              className="inline-flex items-center p-0.5 rounded-lg border border-[#f2efeb]/12 bg-[#111113]"
+              role="group"
+              aria-label="Payables grouping"
+            >
+              <button
+                type="button"
+                data-testid="payables-by-chapter-btn"
+                onClick={() => setGroupPayablesByChapter(true)}
+                className={`h-8 px-3 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                  groupPayablesByChapter
+                    ? 'bg-[#C81E2B] text-white'
+                    : 'text-[#f2efeb]/70 hover:text-[#f2efeb]'
+                }`}
+              >
+                By chapter
+              </button>
+              <button
+                type="button"
+                data-testid="payables-by-substitute-btn"
+                onClick={() => setGroupPayablesByChapter(false)}
+                className={`h-8 px-3 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                  !groupPayablesByChapter
+                    ? 'bg-[#C81E2B] text-white'
+                    : 'text-[#f2efeb]/70 hover:text-[#f2efeb]'
+                }`}
+              >
+                By substitute
+              </button>
+            </div>
           )}
         </div>
 
-        {filtersOpen && (
-          <div className="p-3.5 space-y-2.5">
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
-              <div className="relative">
-                <Search className="w-3.5 h-3.5 text-[#94A3B8] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-                <input
-                  type="search"
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Search member, sub, ref..."
-                  className="w-full h-9 pl-8 pr-3 rounded-lg border border-[#E6E8EF] bg-white text-xs text-[#142342] focus:outline-none focus:border-[#6D28D9]"
-                />
-              </div>
+        <button
+          type="button"
+          onClick={() => setFiltersOpen((o) => !o)}
+          className={`h-9 px-3 rounded-lg border text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+            filtersOpen || hasActiveFilters
+              ? 'border-[#E2B340]/50 bg-[#1f1f23] text-[#E2B340]'
+              : 'border-[#f2efeb]/12 bg-[#111113] text-[#f2efeb]/75 hover:text-[#f2efeb]'
+          }`}
+        >
+          More Filters{hasActiveFilters ? ' · Active' : ''}
+        </button>
+      </div>
 
-              <select
-                aria-label="Filter finance by date range"
-                value={datePreset}
-                onChange={(e) => setDatePreset(e.target.value as DatePreset)}
-                className="h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-xs text-[#142342]"
+      {/* Collapsible Advanced Filter Drawer */}
+      {filtersOpen && (
+        <div className="rounded-xl border border-[#f2efeb]/10 bg-[#18181a] p-3.5 space-y-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-semibold text-[#f2efeb]/80">Advanced Filters</span>
+            {hasActiveFilters && (
+              <button
+                type="button"
+                onClick={resetAllFilters}
+                className="text-xs font-semibold text-[#E2B340] hover:underline cursor-pointer"
               >
-                <option value="ALL">All Dates</option>
-                <option value="TODAY_TMRW">Today &amp; Tomorrow</option>
-                <option value="WEEK">Last 7 Days</option>
-                <option value="MONTH">Last 30 Days</option>
-                <option value="CUSTOM">Custom Range</option>
-              </select>
-
-              <select
-                aria-label="Filter finance by date basis"
-                value={dateBasis}
-                onChange={(e) => setDateBasis(e.target.value as 'MEETING_DATE' | 'PAYMENT_DATE')}
-                className="h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-xs text-[#142342]"
-              >
-                <option value="MEETING_DATE">Basis: Meeting Date</option>
-                <option value="PAYMENT_DATE">Basis: Payment Date</option>
-              </select>
-
-              <select
-                aria-label="Filter finance by payment status"
-                value={statusFilter}
-                onChange={(e) => setStatusFilter(e.target.value as PayStatusFilter)}
-                className="h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-xs text-[#142342]"
-              >
-                <option value="ALL">All Statuses</option>
-                <option value="OUTSTANDING">Outstanding Only</option>
-                <option value="SETTLED">Settled Only</option>
-                <option value="ON_HOLD">On Hold / Disputed</option>
-              </select>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
-              <select
-                aria-label="Filter finance by chapter"
-                value={chapterFilter}
-                onChange={(e) => setChapterFilter(e.target.value)}
-                className="h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-xs text-[#142342]"
-              >
-                <option value="ALL">All Chapters</option>
-                {data.chapters.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
-
-              {isAdmin && (
-                <select
-                  aria-label="Filter finance by responsible coordinator"
-                  value={responsibleCoordFilter}
-                  onChange={(e) => setResponsibleCoordFilter(e.target.value)}
-                  className="h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-xs text-[#142342]"
-                >
-                  <option value="ALL">Responsible: All</option>
-                  {data.coordinatorDirectory.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      Owner: {c.name}
-                    </option>
-                  ))}
-                </select>
-              )}
-
-              <select
-                aria-label="Filter finance by assigned via coordinator"
-                value={viaCoordFilter}
-                onChange={(e) => setViaCoordFilter(e.target.value)}
-                className="h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-xs text-[#142342]"
-              >
-                <option value="ALL">Assigned Via: All</option>
-                {data.coordinatorDirectory.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    Via {c.name}
-                  </option>
-                ))}
-              </select>
-
-              <select
-                aria-label="Filter finance by substitute or partner"
-                value={subFilter}
-                onChange={(e) => setSubFilter(e.target.value)}
-                className="h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-xs text-[#142342]"
-              >
-                <option value="ALL">All Substitutes / Partners</option>
-                {data.substitutes.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
-                  </option>
-                ))}
-              </select>
-
-              <select
-                aria-label="Filter finance by fulfillment mode"
-                value={modeFilter}
-                onChange={(e) => setModeFilter(e.target.value as 'ALL' | 'SELF' | 'DELEGATED')}
-                className="h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-xs text-[#142342]"
-              >
-                <option value="ALL">Mode: Self &amp; Delegated</option>
-                <option value="SELF">Self-Attended Only</option>
-                <option value="DELEGATED">Delegated Guest Only</option>
-              </select>
-            </div>
-
-            {datePreset === 'CUSTOM' && (
-              <div className="flex flex-wrap items-center gap-2 text-xs pt-1">
-                <input
-                  type="date"
-                  value={customStart}
-                  onChange={(e) => setCustomStart(e.target.value)}
-                  className="h-8 px-2.5 rounded-lg border border-[#E6E8EF] bg-white"
-                />
-                <span className="text-[#64748B]">to</span>
-                <input
-                  type="date"
-                  value={customEnd}
-                  onChange={(e) => setCustomEnd(e.target.value)}
-                  className="h-8 px-2.5 rounded-lg border border-[#E6E8EF] bg-white"
-                />
-              </div>
+                Reset All
+              </button>
             )}
           </div>
-        )}
-      </div>
-
-      {/* Clickable Accrual vs Cash KPI Strip */}
-      <div className="grid grid-cols-2 lg:grid-cols-6 gap-2.5">
-        <button
-          type="button"
-          onClick={() => {
-            setTab('receipts');
-            setStatusFilter('OUTSTANDING');
-          }}
-          className="p-3.5 rounded-xl border border-[#E6E8EF] hover:border-[#6D28D9]/50 bg-[#F8F7FC] text-left cursor-pointer transition-colors"
-        >
-          <p className="text-[11px] font-medium text-[#64748B]">To Receive</p>
-          <p className="font-display text-lg font-bold text-amber-700 mt-1 tabular-nums">
-            {formatINR(summary.receivablesOutstanding)}
-          </p>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => {
-            setTab('payments');
-            setStatusFilter('OUTSTANDING');
-          }}
-          className="p-3.5 rounded-xl border border-[#E6E8EF] hover:border-[#6D28D9]/50 bg-[#F8F7FC] text-left cursor-pointer transition-colors"
-        >
-          <p className="text-[11px] font-medium text-[#64748B]">To Pay (Subs)</p>
-          <p className="font-display text-lg font-bold text-red-600 mt-1 tabular-nums">
-            {formatINR(summary.payablesOutstanding)}
-          </p>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => {
-            setTab('commissions');
-            setStatusFilter('ALL');
-          }}
-          className="p-3.5 rounded-xl border border-[#E6E8EF] hover:border-[#6D28D9]/50 bg-[#F8F7FC] text-left cursor-pointer transition-colors"
-        >
-          <p className="text-[11px] font-medium text-[#64748B]">Appr. Comm. Due</p>
-          <p className="font-display text-lg font-bold text-[#B58F3D] mt-1 tabular-nums">
-            {formatINR(summary.commissionsOutstanding)}
-          </p>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setTab('ledger')}
-          className="p-3.5 rounded-xl border border-[#E6E8EF] hover:border-[#6D28D9]/50 bg-white text-left cursor-pointer transition-colors"
-        >
-          <p className="text-[11px] font-medium text-[#64748B]">Cash Received</p>
-          <p className="font-display text-lg font-bold text-emerald-700 mt-1 tabular-nums">
-            {formatINR(summary.cashReceived)}
-          </p>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setTab('ledger')}
-          className="p-3.5 rounded-xl border border-[#E6E8EF] hover:border-[#6D28D9]/50 bg-white text-left cursor-pointer transition-colors"
-        >
-          <p className="text-[11px] font-medium text-[#64748B]">Cash Paid</p>
-          <p className="font-display text-lg font-bold text-[#142342] mt-1 tabular-nums">
-            {formatINR(summary.cashPaidToSubstitutes)}
-          </p>
-        </button>
-
-        <div className="p-3.5 rounded-xl border border-[#E6E8EF] bg-white">
-          <p className="text-[11px] font-medium text-[#64748B]">Gross Margin</p>
-          <p className="font-display text-lg font-bold text-[#6D28D9] mt-1 tabular-nums">
-            {formatINR(summary.grossMarginBeforeBonus)}
-          </p>
-          <p className="text-[11px] text-[#64748B] tabular-nums">
-            Net: {formatINR(summary.contributionAfterBonus)}
-          </p>
-        </div>
-      </div>
-
-      {/* RECEIPTS TAB (Member-wise grouped statements) */}
-      {tab === 'receipts' && (
-        <div className="space-y-3">
-          {memberGroups.length === 0 ? (
-            <div className="p-8 rounded-xl border border-dashed border-[#E6E8EF] text-center text-sm text-[#64748B]">
-              No member charges posted yet. Valid meeting finishes post charges automatically.
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-[#f2efeb]/45 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="search"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search member, substitute, ref..."
+                className="w-full h-9 pl-8 pr-3 rounded-lg border border-[#f2efeb]/10 bg-[#111113] text-xs text-[#f2efeb] focus:outline-none focus:border-[#C81E2B]"
+              />
             </div>
-          ) : (
-            memberGroups.map((group) => {
-              const isOpen = expandedGroup[`m-${group.memberId}`] ?? true;
-              const eligibleDue = group.charges
-                .filter((c) => c.status !== 'ON_HOLD')
-                .reduce((s, c) => s + Math.max(0, c.amount - c.receivedAmount), 0);
 
-              const reminderLines = group.charges
-                .filter((c) => c.amount > c.receivedAmount)
-                .map(
-                  (c) =>
-                    `• ${formatShortDate(c.meetingDate)} — ${c.chapterName} (${c.actualAttendeeName}): Due ${formatINR(
-                      c.amount - c.receivedAmount
-                    )}`
-                )
-                .join('\n');
+            <select
+              aria-label="Filter finance by status"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value as PayStatusFilter)}
+              className="h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#111113] text-xs text-[#f2efeb]"
+            >
+              <option value="ALL">All Statuses</option>
+              <option value="OUTSTANDING">Outstanding Only</option>
+              <option value="SETTLED">Settled Only</option>
+              <option value="ON_HOLD">On Hold / Disputed</option>
+            </select>
 
-              return (
-                <div key={group.memberId} className="rounded-xl border border-[#E6E8EF] bg-white overflow-hidden">
-                  <div className="p-4 flex flex-wrap items-center justify-between gap-3">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setExpandedGroup((p) => ({ ...p, [`m-${group.memberId}`]: !isOpen }))
-                      }
-                      className="text-left min-w-0 flex-1 flex items-center gap-2 cursor-pointer"
-                    >
-                      <span className="text-[#64748B]">
-                        {isOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                      </span>
-                      <div className="min-w-0">
-                        <p className="font-display text-sm sm:text-base font-bold text-[#142342] truncate">
-                          {group.memberName}
-                        </p>
-                        <p className="text-xs text-[#64748B] tabular-nums">
-                          {group.unpaidCount} unpaid · Outstanding{' '}
-                          <strong className={group.outstanding > 0 ? 'text-amber-700' : 'text-emerald-700'}>
-                            {formatINR(group.outstanding)}
-                          </strong>
-                        </p>
-                      </div>
-                    </button>
+            <select
+              aria-label="Filter finance by date range"
+              value={datePreset}
+              onChange={(e) => setDatePreset(e.target.value as DatePreset)}
+              className="h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#111113] text-xs text-[#f2efeb]"
+            >
+              <option value="ALL">All Dates</option>
+              <option value="TODAY_TMRW">Today &amp; Tomorrow</option>
+              <option value="WEEK">Last 7 Days</option>
+              <option value="MONTH">Last 30 Days</option>
+              <option value="CUSTOM">Custom Range</option>
+            </select>
 
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <a
-                        href={buildTelHref(group.phone)}
-                        aria-label={`Call ${group.memberName}`}
-                        className="w-9 h-9 rounded-lg border border-[#E6E8EF] bg-white hover:bg-[#F8F7FC] flex items-center justify-center text-[#142342]"
-                      >
-                        <Phone className="w-4 h-4" />
-                      </a>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          onOpenDraft({
-                            templateType: 'MEMBER_REMINDER',
-                            title: `Payment Reminder — ${group.memberName}`,
-                            recipientLabel: group.memberName,
-                            recipientPhone: group.whatsapp,
-                            defaultBody: `Hi ${group.memberName}, here is your AgencyOS statement:\n${reminderLines || 'All meetings settled.'}\nTotal Outstanding: ${formatINR(
-                              group.outstanding
-                            )}. Thank you!`,
-                          })
-                        }
-                        className="h-9 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <MessageCircle className="w-3.5 h-3.5" />
-                        Remind
-                      </button>
-                      {eligibleDue > 0 && (
-                        <button
-                          type="button"
-                          onClick={() => openReceiptModal(group.memberId)}
-                          className="h-9 px-3.5 rounded-lg bg-[#6D28D9] hover:bg-[#5B21B6] text-white text-xs font-semibold inline-flex items-center gap-1 whitespace-nowrap cursor-pointer"
-                        >
-                          <IndianRupee className="w-3.5 h-3.5" />
-                          Record Receipt
-                        </button>
-                      )}
-                    </div>
-                  </div>
+            <select
+              aria-label="Filter finance by date basis"
+              value={dateBasis}
+              onChange={(e) => setDateBasis(e.target.value as 'MEETING_DATE' | 'PAYMENT_DATE')}
+              className="h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#111113] text-xs text-[#f2efeb]"
+            >
+              <option value="MEETING_DATE">Basis: Meeting Date</option>
+              <option value="PAYMENT_DATE">Basis: Payment Date</option>
+            </select>
+          </div>
 
-                  {isOpen && (
-                    <div className="border-t border-[#E6E8EF] divide-y divide-[#E6E8EF]/70 bg-[#F8F7FC]/40">
-                      {group.charges.map((chg) => {
-                        const rem = Math.max(0, chg.amount - chg.receivedAmount);
-                        return (
-                          <div
-                            key={chg.id}
-                            className="px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs"
-                          >
-                            <div className="min-w-0">
-                              <span className="font-semibold text-[#142342]">{formatShortDate(chg.meetingDate)}</span>
-                              <span className="text-[#64748B]">
-                                {' · '}
-                                {chg.chapterName} · Attended by <strong className="text-[#142342]">{chg.actualAttendeeName}</strong>
-                                {chg.isDelegated && <span className="text-[#B58F3D] font-semibold"> (Delegated)</span>}
-                                {' · '}
-                                Via <strong className="text-[#6D28D9]">{coordName(chg.assignedViaCoordinatorId)}</strong>
-                              </span>
-                              {chg.adjustmentNote && (
-                                <p className="text-[11px] text-red-600 mt-0.5">{chg.adjustmentNote}</p>
-                              )}
-                            </div>
-                            <div className="text-right shrink-0 tabular-nums">
-                              <span className="font-bold text-[#142342]">Billed {formatINR(chg.amount)}</span>
-                              <span className="text-[#64748B]"> · Recd {formatINR(chg.receivedAmount)}</span>
-                              <span
-                                className={`ml-2 font-semibold ${
-                                  chg.status === 'ON_HOLD'
-                                    ? 'text-red-600'
-                                    : rem === 0
-                                    ? 'text-emerald-700'
-                                    : 'text-amber-700'
-                                }`}
-                              >
-                                {chg.status === 'ON_HOLD' ? 'On Hold' : rem === 0 ? 'Settled' : `Bal ${formatINR(rem)}`}
-                              </span>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              );
-            })
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+            {isAdmin && (
+              <select
+                aria-label="Filter finance by responsible coordinator"
+                value={responsibleCoordFilter}
+                onChange={(e) => setResponsibleCoordFilter(e.target.value)}
+                className="h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#111113] text-xs text-[#f2efeb]"
+              >
+                <option value="ALL">Responsible: All</option>
+                {data.coordinatorDirectory.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    Owner: {c.name}
+                  </option>
+                ))}
+              </select>
+            )}
+
+            <select
+              aria-label="Filter finance by assigned via coordinator"
+              value={viaCoordFilter}
+              onChange={(e) => setViaCoordFilter(e.target.value)}
+              className="h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#111113] text-xs text-[#f2efeb]"
+            >
+              <option value="ALL">Assigned Via: All</option>
+              {data.coordinatorDirectory.map((c) => (
+                <option key={c.id} value={c.id}>
+                  Via {c.name}
+                </option>
+              ))}
+            </select>
+
+            <select
+              aria-label="Filter finance by Veloctive Team or partner"
+              value={subFilter}
+              onChange={(e) => setSubFilter(e.target.value)}
+              className="h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#111113] text-xs text-[#f2efeb]"
+            >
+              <option value="ALL">All Veloctive Team / Partners</option>
+              {data.substitutes.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name}
+                </option>
+              ))}
+            </select>
+
+            <select
+              aria-label="Filter finance by fulfillment mode"
+              value={modeFilter}
+              onChange={(e) => setModeFilter(e.target.value as 'ALL' | 'SELF' | 'DELEGATED')}
+              className="h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#111113] text-xs text-[#f2efeb]"
+            >
+              <option value="ALL">Mode: Self &amp; Delegated</option>
+              <option value="SELF">Self-Attended Only</option>
+              <option value="DELEGATED">Delegated Guest Only</option>
+            </select>
+          </div>
+
+          {datePreset === 'CUSTOM' && (
+            <div className="flex flex-wrap items-center gap-2 text-xs pt-1">
+              <input
+                type="date"
+                value={customStart}
+                onChange={(e) => setCustomStart(e.target.value)}
+                className="h-8 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#111113]"
+              />
+              <span className="text-[#f2efeb]/60">to</span>
+              <input
+                type="date"
+                value={customEnd}
+                onChange={(e) => setCustomEnd(e.target.value)}
+                className="h-8 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#111113]"
+              />
+            </div>
           )}
         </div>
       )}
 
-      {/* PAYMENTS TAB (Registered Substitute / Partner-wise statements + Appreciation Bonus) */}
-      {tab === 'payments' && (
-        <div className="space-y-3">
-          {substituteGroups.length === 0 ? (
-            <div className="p-8 rounded-xl border border-dashed border-[#E6E8EF] text-center text-sm text-[#64748B]">
-              No substitute payables recorded yet.
+      {/* ==================== RECEIVABLES TAB (BY CHAPTER | BY MEMBER — SS #4) ==================== */}
+      {tab === 'receivables' && (
+        <div className="space-y-4">
+          {memberGroups.length === 0 ? (
+            <div className="p-8 rounded-xl border border-dashed border-[#f2efeb]/12 text-center text-sm text-[#f2efeb]/60">
+              No member receivables match this filter.
             </div>
-          ) : (
-            substituteGroups.map((group) => {
-              const isOpen = expandedGroup[`s-${group.substituteId}`] ?? true;
-              const eligibleDue = group.earnings
-                .filter((e) => e.status !== 'ON_HOLD')
-                .reduce((s, e) => s + Math.max(0, e.amount - e.paidAmount), 0);
-
-              const stmtLines = group.earnings
-                .map(
-                  (e) =>
-                    `• ${formatShortDate(e.meetingDate)} — ${e.chapterName} (${e.actualAttendeeName}): ${formatINR(
-                      e.amount
-                    )} (Paid ${formatINR(e.paidAmount)})`
-                )
-                .join('\n');
-
-              return (
-                <div key={group.substituteId} className="rounded-xl border border-[#E6E8EF] bg-white overflow-hidden">
-                  <div className="p-4 flex flex-wrap items-center justify-between gap-3">
+          ) : groupReceivablesByChapter ? (
+            <div className="space-y-4">
+              {receivablesByChapter.map((chGroup) => {
+                const isChapterOpen = expandedChapter[chGroup.chapterName] ?? true;
+                return (
+                  <div
+                    key={chGroup.chapterName}
+                    data-testid={`receivables-chapter-${chGroup.chapterName}`}
+                    className="rounded-xl border border-[#f2efeb]/12 bg-[#18181a] overflow-hidden"
+                  >
                     <button
                       type="button"
+                      aria-expanded={isChapterOpen}
                       onClick={() =>
-                        setExpandedGroup((p) => ({ ...p, [`s-${group.substituteId}`]: !isOpen }))
+                        setExpandedChapter((prev) => ({
+                          ...prev,
+                          [chGroup.chapterName]: !isChapterOpen,
+                        }))
                       }
-                      className="text-left min-w-0 flex-1 flex items-center gap-2 cursor-pointer"
+                      className="w-full px-5 py-3.5 bg-[#1f1f23] flex items-center justify-between gap-3 text-left cursor-pointer hover:bg-white/[0.03] transition-colors"
                     >
-                      <span className="text-[#64748B]">
-                        {isOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                      </span>
                       <div className="min-w-0">
-                        <p className="font-display text-sm sm:text-base font-bold text-[#142342] truncate">
-                          {group.substituteName}
+                        <p className="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-[#f2efeb]/45">
+                          Chapter
                         </p>
-                        <p className="text-xs text-[#64748B] tabular-nums">
-                          {group.unpaidCount} unpaid · Due{' '}
-                          <strong className={group.outstanding > 0 ? 'text-red-600' : 'text-emerald-700'}>
-                            {formatINR(group.outstanding)}
-                          </strong>
+                        <h3 className="font-display text-base font-bold text-[#f2efeb] truncate mt-0.5">
+                          {chGroup.chapterName}
+                        </h3>
+                        <p className="text-xs text-[#f2efeb]/55 mt-0.5 tabular-nums">
+                          {chGroup.members.length} member{chGroup.members.length === 1 ? '' : 's'} · Billed{' '}
+                          {formatINR(chGroup.totalBilled)} · Outstanding {formatINR(chGroup.totalOutstanding)}
+                        </p>
+                      </div>
+                      <span className="text-[#f2efeb]/50 shrink-0">
+                        {isChapterOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                      </span>
+                    </button>
+
+                    {isChapterOpen && (
+                      <div className="divide-y divide-[#f2efeb]/10 border-t border-[#f2efeb]/10">
+                        {chGroup.members.map((group) => {
+                          const eligibleDue = group.charges
+                            .filter((c) => c.status !== 'ON_HOLD')
+                            .reduce((s, c) => s + Math.max(0, c.amount - c.receivedAmount), 0);
+
+                          return (
+                            <div key={group.memberId} className="px-5 py-4 space-y-3">
+                              <div className="flex flex-wrap items-center justify-between gap-3">
+                                <div className="min-w-0">
+                                  <h4 className="font-display text-[15px] font-bold text-[#f2efeb] truncate">
+                                    {group.memberName}
+                                  </h4>
+                                  <p className="text-xs text-[#f2efeb]/60 mt-0.5 tabular-nums">
+                                    {group.charges.length} absence{group.charges.length === 1 ? '' : 's'} · Billed{' '}
+                                    {formatINR(group.totalBilled)} ·{' '}
+                                    <span
+                                      className={
+                                        group.outstanding > 0
+                                          ? 'text-[#E12D39] font-semibold'
+                                          : 'text-emerald-400 font-semibold'
+                                      }
+                                    >
+                                      Outstanding {formatINR(group.outstanding)}
+                                    </span>
+                                  </p>
+                                </div>
+
+                                <div className="flex items-center gap-2 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      onOpenDraft({
+                                        templateType: 'MEMBER_REMINDER',
+                                        title: `Payment Reminder — ${group.memberName}`,
+                                        recipientLabel: group.memberName,
+                                        recipientPhone: group.whatsapp,
+                                        defaultBody: buildMemberReminderWhatsAppText({
+                                          memberName: group.memberName,
+                                          items: group.charges.map((c) => ({
+                                            meetingDate: c.meetingDate,
+                                            chapterName: c.chapterName,
+                                            dueAmount: Math.max(0, c.amount - c.receivedAmount),
+                                          })),
+                                          totalOutstanding: group.outstanding,
+                                        }),
+                                      })
+                                    }
+                                    className="h-9 px-3 rounded-lg bg-emerald-500/12 border border-emerald-500/25 hover:bg-emerald-500/20 text-emerald-400 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                                  >
+                                    <MessageCircle className="w-3.5 h-3.5" />
+                                    Draft
+                                  </button>
+                                  {eligibleDue > 0 ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => openReceiptModal(group.memberId)}
+                                      className="h-9 px-4 rounded-lg bg-[#C81E2B] hover:bg-[#A31621] text-white text-xs font-semibold whitespace-nowrap cursor-pointer transition-colors"
+                                    >
+                                      Record Receipt
+                                    </button>
+                                  ) : group.outstanding > 0 ? (
+                                    <span className="h-9 px-3 rounded-lg bg-red-500/12 border border-red-500/30 text-red-400 text-xs font-semibold inline-flex items-center gap-1 whitespace-nowrap">
+                                      On Hold
+                                    </span>
+                                  ) : (
+                                    <span className="h-9 px-3 rounded-lg bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 text-xs font-semibold inline-flex items-center gap-1">
+                                      <CheckCircle2 className="w-3.5 h-3.5" />
+                                      Settled
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="space-y-1.5 pt-1">
+                                {group.charges.map((chg) => {
+                                  const isSettled = chg.receivedAmount >= chg.amount;
+                                  return (
+                                    <div
+                                      key={chg.id}
+                                      className="flex items-center justify-between gap-3 text-xs sm:text-[13px]"
+                                    >
+                                      <div className="min-w-0 truncate text-[#f2efeb]/85">
+                                        <span className="tabular-nums font-medium">{chg.meetingDate}</span>
+                                        <span className="mx-1.5 text-[#f2efeb]/40">·</span>
+                                        <span className="text-[#f2efeb]/65">
+                                          covered by <span className="text-[#f2efeb]/90">{chg.actualAttendeeName}</span>
+                                        </span>
+                                        {chg.isDelegated && (
+                                          <span className="ml-1.5 text-[11px] text-[#E2B340]">(Guest)</span>
+                                        )}
+                                        {chg.status === 'ON_HOLD' && (
+                                          <span className="ml-1.5 text-[11px] text-red-400 font-semibold">· On Hold</span>
+                                        )}
+                                      </div>
+                                      <span
+                                        className={`shrink-0 tabular-nums font-semibold ${
+                                          chg.status === 'ON_HOLD'
+                                            ? 'text-red-400'
+                                            : isSettled
+                                            ? 'text-emerald-400'
+                                            : 'text-[#f2efeb]'
+                                        }`}
+                                      >
+                                        {formatINR(chg.receivedAmount)} / {formatINR(chg.amount)}
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {memberGroups.map((group) => {
+                const eligibleDue = group.charges
+                  .filter((c) => c.status !== 'ON_HOLD')
+                  .reduce((s, c) => s + Math.max(0, c.amount - c.receivedAmount), 0);
+                return (
+                  <div
+                    key={group.memberId}
+                    className="rounded-xl border border-[#f2efeb]/12 bg-[#18181a] overflow-hidden"
+                  >
+                    <div className="px-5 py-4 flex flex-wrap items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <h3 className="font-display text-base font-bold text-[#f2efeb] truncate">
+                          {group.memberName}
+                        </h3>
+                        <p className="text-xs text-[#f2efeb]/60 mt-0.5 tabular-nums">
+                          {group.chapterName} · Billed {formatINR(group.totalBilled)} ·{' '}
+                          <span
+                            className={
+                              group.outstanding > 0
+                                ? 'text-[#E12D39] font-semibold'
+                                : 'text-emerald-400 font-semibold'
+                            }
+                          >
+                            Outstanding {formatINR(group.outstanding)}
+                          </span>
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onOpenDraft({
+                              templateType: 'MEMBER_REMINDER',
+                              title: `Payment Reminder — ${group.memberName}`,
+                              recipientLabel: group.memberName,
+                              recipientPhone: group.whatsapp,
+                              defaultBody: buildMemberReminderWhatsAppText({
+                                memberName: group.memberName,
+                                items: group.charges.map((c) => ({
+                                  meetingDate: c.meetingDate,
+                                  chapterName: c.chapterName,
+                                  dueAmount: Math.max(0, c.amount - c.receivedAmount),
+                                })),
+                                totalOutstanding: group.outstanding,
+                              }),
+                            })
+                          }
+                          className="h-9 px-3 rounded-lg bg-emerald-500/12 border border-emerald-500/25 hover:bg-emerald-500/20 text-emerald-400 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <MessageCircle className="w-3.5 h-3.5" />
+                          Draft
+                        </button>
+                        {eligibleDue > 0 ? (
+                          <button
+                            type="button"
+                            onClick={() => openReceiptModal(group.memberId)}
+                            className="h-9 px-4 rounded-lg bg-[#C81E2B] hover:bg-[#A31621] text-white text-xs font-semibold whitespace-nowrap cursor-pointer"
+                          >
+                            Record Receipt
+                          </button>
+                        ) : group.outstanding > 0 ? (
+                          <span className="h-9 px-3 rounded-lg bg-red-500/12 border border-red-500/30 text-red-400 text-xs font-semibold inline-flex items-center gap-1 whitespace-nowrap">
+                            On Hold
+                          </span>
+                        ) : (
+                          <span className="h-9 px-3 rounded-lg bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 text-xs font-semibold inline-flex items-center gap-1">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            Settled
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="border-t border-[#f2efeb]/10 px-5 py-3 space-y-1.5">
+                      {group.charges.map((chg) => {
+                        const isSettled = chg.receivedAmount >= chg.amount;
+                        return (
+                          <div key={chg.id} className="flex items-center justify-between gap-3 text-xs sm:text-[13px]">
+                            <div className="min-w-0 truncate text-[#f2efeb]/85">
+                              <span className="tabular-nums font-medium">{chg.meetingDate}</span>
+                              <span className="mx-1.5 text-[#f2efeb]/40">·</span>
+                              <span className="text-[#f2efeb]/65">
+                                covered by <span className="text-[#f2efeb]/90">{chg.actualAttendeeName}</span>
+                              </span>
+                              <span className="mx-1.5 text-[#f2efeb]/40">·</span>
+                              <span className="text-[#f2efeb]/55">{chg.chapterName}</span>
+                            </div>
+                            <span
+                              className={`shrink-0 tabular-nums font-semibold ${
+                                chg.status === 'ON_HOLD'
+                                  ? 'text-red-400'
+                                  : isSettled
+                                  ? 'text-emerald-400'
+                                  : 'text-[#f2efeb]'
+                              }`}
+                            >
+                              {formatINR(chg.receivedAmount)} / {formatINR(chg.amount)}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ==================== PAYABLES TAB (BY CHAPTER | BY SUBSTITUTE — SS #4) ==================== */}
+      {tab === 'payables' && (
+        <div className="space-y-4">
+          {substituteGroups.length === 0 ? (
+            <div className="p-8 rounded-xl border border-dashed border-[#f2efeb]/12 text-center text-sm text-[#f2efeb]/60">
+              No Veloctive Team payables match your current filter.
+            </div>
+          ) : groupPayablesByChapter ? (
+            <div className="space-y-4" data-testid="payables-by-chapter-view">
+              {payablesByChapter.map((chGroup) => {
+                const isChapterOpen = expandedPayableChapter[chGroup.chapterName] ?? true;
+                return (
+                  <div
+                    key={chGroup.chapterName}
+                    data-testid={`payables-chapter-${chGroup.chapterName}`}
+                    className="rounded-xl border border-[#f2efeb]/12 bg-[#18181a] overflow-hidden"
+                  >
+                    <button
+                      type="button"
+                      aria-expanded={isChapterOpen}
+                      onClick={() =>
+                        setExpandedPayableChapter((prev) => ({
+                          ...prev,
+                          [chGroup.chapterName]: !isChapterOpen,
+                        }))
+                      }
+                      className="w-full px-5 py-3.5 bg-[#1f1f23] flex items-center justify-between gap-3 text-left cursor-pointer hover:bg-white/[0.03] transition-colors"
+                    >
+                      <div className="min-w-0">
+                        <p className="font-mono text-[10px] font-bold uppercase tracking-[0.12em] text-[#f2efeb]/45">
+                          Chapter
+                        </p>
+                        <h3 className="font-display text-base font-bold text-[#f2efeb] truncate mt-0.5">
+                          {chGroup.chapterName}
+                        </h3>
+                        <p className="text-xs text-[#f2efeb]/55 mt-0.5 tabular-nums">
+                          {chGroup.substitutes.length} substitute{chGroup.substitutes.length === 1 ? '' : 's'} · Earned{' '}
+                          {formatINR(chGroup.totalEarned)} · Outstanding {formatINR(chGroup.totalOutstanding)}
+                        </p>
+                      </div>
+                      <span className="text-[#f2efeb]/50 shrink-0">
+                        {isChapterOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                      </span>
+                    </button>
+
+                    {isChapterOpen && (
+                      <div className="divide-y divide-[#f2efeb]/10 border-t border-[#f2efeb]/10">
+                        {chGroup.substitutes.map((group) => {
+                          const eligibleDue = group.earnings
+                            .filter((e) => e.status !== 'ON_HOLD')
+                            .reduce((s, e) => s + Math.max(0, e.amount - e.paidAmount), 0);
+
+                          return (
+                            <div key={`${chGroup.chapterName}-${group.substituteId}`} className="px-5 py-4 space-y-3">
+                              <div className="flex flex-wrap items-center justify-between gap-3">
+                                <div className="min-w-0">
+                                  <h4 className="font-display text-[15px] font-bold text-[#f2efeb] truncate">
+                                    {group.substituteName}
+                                  </h4>
+                                  <p className="text-xs text-[#f2efeb]/60 mt-0.5 tabular-nums">
+                                    {group.earnings.length} meeting{group.earnings.length === 1 ? '' : 's'} · Earned{' '}
+                                    {formatINR(group.totalEarned)} ·{' '}
+                                    <span
+                                      className={
+                                        group.outstanding > 0
+                                          ? 'text-[#E12D39] font-semibold'
+                                          : 'text-emerald-400 font-semibold'
+                                      }
+                                    >
+                                      Outstanding {formatINR(group.outstanding)}
+                                    </span>
+                                  </p>
+                                </div>
+
+                                <div className="flex items-center gap-2 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      onOpenDraft({
+                                        templateType: 'PAYOUT_SUMMARY',
+                                        title: `Payout Summary — ${group.substituteName}`,
+                                        recipientLabel: group.substituteName,
+                                        recipientPhone: group.whatsapp,
+                                        defaultBody: buildPayoutSummaryWhatsAppText({
+                                          substituteName: group.substituteName,
+                                          items: group.earnings.map((e) => ({
+                                            meetingDate: e.meetingDate,
+                                            chapterName: e.chapterName,
+                                            amount: e.amount,
+                                          })),
+                                          bonusesTotal: group.bonusesTotal,
+                                          outstanding: group.outstanding,
+                                        }),
+                                      })
+                                    }
+                                    className="h-9 px-3 rounded-lg bg-emerald-500/12 border border-emerald-500/25 hover:bg-emerald-500/20 text-emerald-400 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                                  >
+                                    <MessageCircle className="w-3.5 h-3.5" />
+                                    Draft
+                                  </button>
+                                  {eligibleDue > 0 ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => openPayoutModal(group.substituteId)}
+                                      className="h-9 px-4 rounded-lg bg-[#C81E2B] hover:bg-[#A31621] text-white text-xs font-semibold whitespace-nowrap cursor-pointer transition-colors"
+                                    >
+                                      Record Payout
+                                    </button>
+                                  ) : group.outstanding > 0 ? (
+                                    <span className="h-9 px-3 rounded-lg bg-red-500/12 border border-red-500/30 text-red-400 text-xs font-semibold inline-flex items-center gap-1 whitespace-nowrap">
+                                      On Hold
+                                    </span>
+                                  ) : (
+                                    <span className="h-9 px-3 rounded-lg bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 text-xs font-semibold inline-flex items-center gap-1">
+                                      <CheckCircle2 className="w-3.5 h-3.5" />
+                                      Settled
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="space-y-1.5 pt-1">
+                                {group.earnings.map((earn) => {
+                                  const isSettled = earn.paidAmount >= earn.amount;
+                                  return (
+                                    <div
+                                      key={earn.id}
+                                      className="flex items-center justify-between gap-3 text-xs sm:text-[13px]"
+                                    >
+                                      <div className="min-w-0 truncate text-[#f2efeb]/85">
+                                        <span className="tabular-nums font-medium">{earn.meetingDate}</span>
+                                        <span className="mx-1.5 text-[#f2efeb]/40">·</span>
+                                        <span className="text-[#f2efeb]/70">for {earn.memberName}</span>
+                                        {earn.isDelegated && (
+                                          <span className="ml-1.5 text-[11px] text-[#E2B340]">
+                                            (Guest: {earn.actualAttendeeName})
+                                          </span>
+                                        )}
+                                        {earn.status === 'ON_HOLD' && (
+                                          <span className="ml-1.5 text-[11px] text-red-400 font-semibold">· On Hold</span>
+                                        )}
+                                      </div>
+                                      <span
+                                        className={`shrink-0 tabular-nums font-semibold ${
+                                          earn.status === 'ON_HOLD'
+                                            ? 'text-red-400'
+                                            : isSettled
+                                            ? 'text-emerald-400'
+                                            : 'text-[#f2efeb]'
+                                        }`}
+                                      >
+                                        {formatINR(earn.paidAmount)} / {formatINR(earn.amount)}
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="space-y-3" data-testid="payables-by-substitute-view">
+              {substituteGroups.map((group) => {
+                const eligibleDue = group.earnings
+                  .filter((e) => e.status !== 'ON_HOLD')
+                  .reduce((s, e) => s + Math.max(0, e.amount - e.paidAmount), 0);
+
+                return (
+                  <div
+                    key={group.substituteId}
+                    className="rounded-xl border border-[#f2efeb]/12 bg-[#18181a] overflow-hidden"
+                  >
+                    <div className="px-5 py-4 flex flex-wrap items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <h3 className="font-display text-base font-bold text-[#f2efeb] truncate">
+                          {group.substituteName}
+                        </h3>
+                        <p className="text-xs text-[#f2efeb]/60 mt-0.5 tabular-nums">
+                          Earned {formatINR(group.totalEarned)} ·{' '}
+                          <span
+                            className={
+                              group.outstanding > 0
+                                ? 'text-[#E12D39] font-semibold'
+                                : 'text-emerald-400 font-semibold'
+                            }
+                          >
+                            Outstanding {formatINR(group.outstanding)}
+                          </span>
                           {group.bonusesTotal > 0 && (
-                            <span className="text-[#B58F3D] font-semibold">
-                              {' · '}Bonus paid {formatINR(group.bonusesTotal)}
+                            <span className="text-[#E2B340] font-semibold">
+                              {' · '}Bonus {formatINR(group.bonusesTotal)}
                             </span>
                           )}
                         </p>
                       </div>
-                    </button>
 
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <a
-                        href={buildTelHref(group.phone)}
-                        aria-label={`Call ${group.substituteName}`}
-                        className="w-9 h-9 rounded-lg border border-[#E6E8EF] bg-white hover:bg-[#F8F7FC] flex items-center justify-center text-[#142342]"
-                      >
-                        <Phone className="w-4 h-4" />
-                      </a>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          onOpenDraft({
-                            templateType: 'PAYOUT_SUMMARY',
-                            title: `Payout Summary — ${group.substituteName}`,
-                            recipientLabel: group.substituteName,
-                            recipientPhone: group.whatsapp,
-                            defaultBody: `Thank you for supporting our assignments, ${group.substituteName}.\n${stmtLines}\nAppreciation bonus credited: ${formatINR(
-                              group.bonusesTotal
-                            )}\nRemaining Balance: ${formatINR(group.outstanding)}`,
-                          })
-                        }
-                        className="h-9 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <MessageCircle className="w-3.5 h-3.5" />
-                        Summary
-                      </button>
-                      {eligibleDue > 0 && (
+                      <div className="flex items-center gap-2 shrink-0">
                         <button
                           type="button"
-                          onClick={() => openPayoutModal(group.substituteId)}
-                          className="h-9 px-3.5 rounded-lg bg-[#6D28D9] hover:bg-[#5B21B6] text-white text-xs font-semibold inline-flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                          onClick={() =>
+                            onOpenDraft({
+                              templateType: 'PAYOUT_SUMMARY',
+                              title: `Payout Summary — ${group.substituteName}`,
+                              recipientLabel: group.substituteName,
+                              recipientPhone: group.whatsapp,
+                              defaultBody: buildPayoutSummaryWhatsAppText({
+                                substituteName: group.substituteName,
+                                items: group.earnings.map((e) => ({
+                                  meetingDate: e.meetingDate,
+                                  chapterName: e.chapterName,
+                                  amount: e.amount,
+                                })),
+                                bonusesTotal: group.bonusesTotal,
+                                outstanding: group.outstanding,
+                              }),
+                            })
+                          }
+                          className="h-9 px-3 rounded-lg bg-emerald-500/12 border border-emerald-500/25 hover:bg-emerald-500/20 text-emerald-400 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition-colors"
                         >
-                          <IndianRupee className="w-3.5 h-3.5" />
-                          Record Payout
+                          <MessageCircle className="w-3.5 h-3.5" />
+                          Draft
                         </button>
-                      )}
+                        {eligibleDue > 0 ? (
+                          <button
+                            type="button"
+                            onClick={() => openPayoutModal(group.substituteId)}
+                            className="h-9 px-4 rounded-lg bg-[#C81E2B] hover:bg-[#A31621] text-white text-xs font-semibold whitespace-nowrap cursor-pointer transition-colors"
+                          >
+                            Record Payout
+                          </button>
+                        ) : group.outstanding > 0 ? (
+                          <span className="h-9 px-3 rounded-lg bg-red-500/12 border border-red-500/30 text-red-400 text-xs font-semibold inline-flex items-center gap-1 whitespace-nowrap">
+                            On Hold
+                          </span>
+                        ) : (
+                          <span className="h-9 px-3 rounded-lg bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 text-xs font-semibold inline-flex items-center gap-1">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            Settled
+                          </span>
+                        )}
+                      </div>
                     </div>
-                  </div>
 
-                  {isOpen && (
-                    <div className="border-t border-[#E6E8EF] divide-y divide-[#E6E8EF]/70 bg-[#F8F7FC]/40">
+                    <div className="border-t border-[#f2efeb]/10 px-5 py-3 space-y-1.5">
                       {group.earnings.map((earn) => {
-                        const rem = Math.max(0, earn.amount - earn.paidAmount);
+                        const isSettled = earn.paidAmount >= earn.amount;
                         return (
                           <div
                             key={earn.id}
-                            className="px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs"
+                            className="flex items-center justify-between gap-3 text-xs sm:text-[13px]"
                           >
-                            <div className="min-w-0">
-                              <span className="font-semibold text-[#142342]">{formatShortDate(earn.meetingDate)}</span>
-                              <span className="text-[#64748B]">
-                                {' · '}
-                                {earn.chapterName} · Attendee: <strong className="text-[#142342]">{earn.actualAttendeeName}</strong>
-                                {earn.isDelegated && <span className="text-[#B58F3D] font-semibold"> (Delegated — paid to Partner)</span>}
-                                {' · '}
-                                Via <strong className="text-[#6D28D9]">{earn.assignedViaCoordinatorName}</strong>
-                              </span>
-                              {earn.adjustmentNote && (
-                                <p className="text-[11px] text-red-600 mt-0.5">{earn.adjustmentNote}</p>
+                            <div className="min-w-0 truncate text-[#f2efeb]/85">
+                              <span className="tabular-nums font-medium">{earn.meetingDate}</span>
+                              <span className="mx-1.5 text-[#f2efeb]/40">·</span>
+                              <span>{earn.chapterName}</span>
+                              <span className="mx-1.5 text-[#f2efeb]/40">·</span>
+                              <span className="text-[#f2efeb]/65">{earn.memberName}</span>
+                              {earn.isDelegated && (
+                                <span className="ml-1.5 text-[11px] text-[#E2B340]">
+                                  (Guest: {earn.actualAttendeeName})
+                                </span>
+                              )}
+                              {earn.status === 'ON_HOLD' && (
+                                <span className="ml-1.5 text-[11px] text-red-400 font-semibold">· On Hold</span>
                               )}
                             </div>
-                            <div className="text-right shrink-0 tabular-nums">
-                              <span className="font-bold text-[#142342]">Payable {formatINR(earn.amount)}</span>
-                              <span className="text-[#64748B]"> · Paid {formatINR(earn.paidAmount)}</span>
-                              <span
-                                className={`ml-2 font-semibold ${
-                                  earn.status === 'ON_HOLD'
-                                    ? 'text-red-600'
-                                    : rem === 0
-                                    ? 'text-emerald-700'
-                                    : 'text-red-600'
-                                }`}
-                              >
-                                {earn.status === 'ON_HOLD' ? 'On Hold' : rem === 0 ? 'Settled' : `Bal ${formatINR(rem)}`}
-                              </span>
-                            </div>
+                            <span
+                              className={`shrink-0 tabular-nums font-semibold ${
+                                earn.status === 'ON_HOLD'
+                                  ? 'text-red-400'
+                                  : isSettled
+                                  ? 'text-emerald-400'
+                                  : 'text-[#f2efeb]'
+                              }`}
+                            >
+                              {formatINR(earn.paidAmount)} / {formatINR(earn.amount)}
+                            </span>
                           </div>
                         );
                       })}
                     </div>
-                  )}
-                </div>
-              );
-            })
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
       )}
 
-      {/* APPROVED COORDINATOR COMMISSIONS TAB (Separate optional ledger — ₹0 by default unless explicitly approved) */}
-      {tab === 'commissions' && (
-        <div className="space-y-3">
-          <div className="p-3.5 rounded-xl bg-[#F8F7FC] border border-[#E6E8EF] text-xs text-[#475569]">
-            <strong className="text-[#142342]">Zero-By-Default Policy:</strong> Coordinator commissions are posted here ONLY when explicitly approved on a request/assignment and validly finished. Attribution tags like &ldquo;Assigned Via&rdquo; alone always post ₹0.
+      {/* ==================== RECEIPTS HISTORY TAB ==================== */}
+      {tab === 'receipts_log' && (
+        <div className="rounded-xl border border-[#f2efeb]/12 bg-[#18181a] overflow-hidden">
+          <div className="px-4 py-3 border-b border-[#f2efeb]/10 bg-[#1f1f23] flex items-center justify-between">
+            <h3 className="font-display text-sm font-bold text-[#f2efeb]">
+              Member Cash Receipts ({filteredReceipts.length})
+            </h3>
+            <span className="text-xs text-[#f2efeb]/60">Immutable receipt log</span>
+          </div>
+          <div className="divide-y divide-[#f2efeb]/10">
+            {filteredReceipts.length === 0 ? (
+              <p className="p-8 text-center text-sm text-[#f2efeb]/60">No client receipts recorded in this filter.</p>
+            ) : (
+              filteredReceipts.map((r) => {
+                const m = data.members.find((x) => x.id === r.memberId);
+                return (
+                  <div key={r.id} className="px-4 sm:px-5 py-3.5 flex items-center justify-between gap-3 text-xs sm:text-[13px]">
+                    <div className="min-w-0">
+                      <p className="font-semibold text-[#f2efeb] truncate">
+                        {m?.name ?? r.memberId} · {r.method}
+                      </p>
+                      <p className="text-[#f2efeb]/60 mt-0.5 font-mono text-[11px]">
+                        {r.paymentDate} · Ref {r.reference || '—'} · {r.allocations.length} meeting(s)
+                      </p>
+                    </div>
+                    <span className="font-display text-sm font-bold text-emerald-400 tabular-nums shrink-0">
+                      +{formatINR(r.amount)}
+                    </span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ==================== PAYOUTS HISTORY TAB ==================== */}
+      {tab === 'payouts_log' && (
+        <div className="space-y-4">
+          <div className="rounded-xl border border-[#f2efeb]/12 bg-[#18181a] overflow-hidden">
+            <div className="px-4 py-3 border-b border-[#f2efeb]/10 bg-[#1f1f23] flex items-center justify-between">
+              <h3 className="font-display text-sm font-bold text-[#f2efeb]">
+                Veloctive Team Payouts ({filteredPayouts.length})
+              </h3>
+              <span className="text-xs text-[#f2efeb]/60">Immutable payout log</span>
+            </div>
+            <div className="divide-y divide-[#f2efeb]/10">
+              {filteredPayouts.length === 0 ? (
+                <p className="p-8 text-center text-sm text-[#f2efeb]/60">No payouts recorded in this filter.</p>
+              ) : (
+                filteredPayouts.map((p) => {
+                  const s = data.substitutes.find((x) => x.id === p.payeeSubstituteId);
+                  return (
+                    <div key={p.id} className="px-4 sm:px-5 py-3.5 flex items-center justify-between gap-3 text-xs sm:text-[13px]">
+                      <div className="min-w-0">
+                        <p className="font-semibold text-[#f2efeb] truncate">
+                          {s?.name ?? p.payeeSubstituteId} · {p.method}
+                          {p.bonusAmount > 0 && (
+                            <span className="ml-1.5 text-[#E2B340] inline-flex items-center gap-0.5">
+                              <Award className="w-3.5 h-3.5" />
+                              +{formatINR(p.bonusAmount)} Bonus
+                            </span>
+                          )}
+                        </p>
+                        <p className="text-[#f2efeb]/60 mt-0.5 font-mono text-[11px]">
+                          {p.paymentDate} · Ref {p.reference || '—'} · {p.allocations.length} meeting(s)
+                        </p>
+                      </div>
+                      <span className="font-display text-sm font-bold text-[#f2efeb] tabular-nums shrink-0">
+                        -{formatINR(p.totalTransferred)}
+                      </span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
           </div>
 
-          <div className="rounded-xl border border-[#E6E8EF] bg-white overflow-hidden divide-y divide-[#E6E8EF]">
+          {data.ledgerAdjustments.length > 0 && (
+            <div className="rounded-xl border border-[#f2efeb]/12 bg-[#18181a] overflow-hidden">
+              <div className="px-4 py-3 border-b border-[#f2efeb]/10 bg-[#1f1f23]">
+                <h3 className="font-display text-sm font-bold text-[#f2efeb]">Audited Ledger Adjustments</h3>
+              </div>
+              <div className="divide-y divide-[#f2efeb]/10">
+                {data.ledgerAdjustments.map((adj) => (
+                  <div key={adj.id} className="px-4 py-3 flex items-center justify-between gap-3 text-xs">
+                    <div>
+                      <p className="font-semibold text-[#f2efeb]">
+                        Audited Adjustment ({adj.targetType.replace(/_/g, ' ')})
+                      </p>
+                      <p className="text-[#f2efeb]/70 mt-0.5">{adj.reason}</p>
+                    </div>
+                    <span className="font-mono font-bold text-amber-400 tabular-nums">
+                      {adj.deltaAmount >= 0
+                        ? `+${formatINR(adj.deltaAmount)}`
+                        : `-${formatINR(Math.abs(adj.deltaAmount))}`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ==================== APPROVED COORDINATOR COMMISSIONS TAB ==================== */}
+      {tab === 'commissions' && (
+        <div className="space-y-3">
+          <div className="p-3.5 rounded-xl bg-[#1f1f23] border border-[#f2efeb]/10 text-xs text-[#f2efeb]/70">
+            <strong className="text-[#f2efeb]">Zero-By-Default Policy:</strong> Coordinator commissions are posted here ONLY when explicitly approved on a request/assignment and validly finished. Attribution tags like &ldquo;Assigned Via&rdquo; alone always post ₹0.
+          </div>
+
+          <div className="rounded-xl border border-[#f2efeb]/12 bg-[#18181a] overflow-hidden divide-y divide-[#f2efeb]/10">
             {filteredCommissions.length === 0 ? (
-              <p className="p-8 text-center text-sm text-[#64748B]">
+              <p className="p-8 text-center text-sm text-[#f2efeb]/60">
                 No approved coordinator commissions match the current filter.
               </p>
             ) : (
@@ -1115,18 +1817,18 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                 return (
                   <div key={cm.id} className="p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
                     <div className="min-w-0">
-                      <p className="font-display text-sm font-bold text-[#142342]">
+                      <p className="font-display text-sm font-bold text-[#f2efeb]">
                         {coordName(cm.coordinatorId)} · {formatShortDate(cm.meetingDate)} · {cm.chapterName}
                       </p>
-                      <p className="text-[#64748B] mt-0.5">
-                        Member: <strong className="text-[#142342]">{cm.memberName}</strong> · Attendee: {cm.actualAttendeeName}
+                      <p className="text-[#f2efeb]/60 mt-0.5">
+                        Member: <strong className="text-[#f2efeb]">{cm.memberName}</strong> · Attendee: {cm.actualAttendeeName}
                         {cm.paymentReference ? ` · Ref ${cm.paymentReference}` : ''}
                       </p>
                     </div>
                     <div className="flex items-center gap-3 shrink-0 tabular-nums">
                       <div className="text-right">
-                        <p className="font-bold text-[#142342]">Approved {formatINR(cm.amount)}</p>
-                        <p className={rem === 0 ? 'text-emerald-700 font-semibold' : 'text-[#B58F3D] font-semibold'}>
+                        <p className="font-bold text-[#f2efeb]">Approved {formatINR(cm.amount)}</p>
+                        <p className={rem === 0 ? 'text-emerald-400 font-semibold' : 'text-[#E2B340] font-semibold'}>
                           {rem === 0 ? `Paid ${formatINR(cm.paidAmount)}` : `Due ${formatINR(rem)}`}
                         </p>
                       </div>
@@ -1141,7 +1843,7 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                             setCommPayMethod('UPI');
                             setCommPayRef('');
                           }}
-                          className="h-9 px-3 rounded-lg bg-[#6D28D9] hover:bg-[#5B21B6] text-white text-xs font-semibold cursor-pointer"
+                          className="h-9 px-3 rounded-lg bg-[#C81E2B] hover:bg-[#A31621] text-white text-xs font-semibold cursor-pointer"
                         >
                           Pay Commission
                         </button>
@@ -1155,124 +1857,53 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
         </div>
       )}
 
-      {/* IMMUTABLE LEDGER TAB */}
-      {tab === 'ledger' && (
-        <div className="space-y-4">
-          <div className="rounded-xl border border-[#E6E8EF] bg-white overflow-hidden">
-            <div className="px-4 py-3 border-b border-[#E6E8EF] bg-[#F8F7FC] flex items-center justify-between">
-              <h3 className="font-display text-sm font-bold text-[#142342]">Cash Receipts &amp; Payouts (Immutable)</h3>
-              <span className="text-xs text-[#64748B]">Never silently edited or deleted</span>
-            </div>
-            <div className="divide-y divide-[#E6E8EF]">
-              {filteredReceipts.map((r) => {
-                const m = data.members.find((x) => x.id === r.memberId);
-                return (
-                  <div key={r.id} className="px-4 py-3 flex items-center justify-between gap-3 text-xs">
-                    <div>
-                      <p className="font-semibold text-[#142342]">
-                        Receipt from {m?.name ?? r.memberId} · {r.method}
-                      </p>
-                      <p className="text-[#64748B] mt-0.5 font-mono text-[11px]">
-                        {r.paymentDate} · Ref {r.reference} · {r.allocations.length} meeting(s) allocated
-                      </p>
-                    </div>
-                    <span className="font-display text-sm font-bold text-emerald-700 tabular-nums shrink-0">
-                      +{formatINR(r.amount)}
-                    </span>
-                  </div>
-                );
-              })}
-
-              {filteredPayouts.map((p) => {
-                const s = data.substitutes.find((x) => x.id === p.payeeSubstituteId);
-                return (
-                  <div key={p.id} className="px-4 py-3 flex items-center justify-between gap-3 text-xs">
-                    <div>
-                      <p className="font-semibold text-[#142342]">
-                        Payout to {s?.name ?? p.payeeSubstituteId} · {p.method}
-                        {p.bonusAmount > 0 && (
-                          <span className="ml-1.5 text-[#B58F3D] inline-flex items-center gap-0.5">
-                            <Award className="w-3.5 h-3.5" />
-                            +{formatINR(p.bonusAmount)} Bonus
-                          </span>
-                        )}
-                      </p>
-                      <p className="text-[#64748B] mt-0.5 font-mono text-[11px]">
-                        {p.paymentDate} · Ref {p.reference} · {p.allocations.length} meeting(s) allocated
-                      </p>
-                    </div>
-                    <span className="font-display text-sm font-bold text-[#142342] tabular-nums shrink-0">
-                      -{formatINR(p.totalTransferred)}
-                    </span>
-                  </div>
-                );
-              })}
-
-              {data.ledgerAdjustments.map((adj) => (
-                <div key={adj.id} className="px-4 py-3 flex items-center justify-between gap-3 text-xs bg-amber-50/40">
-                  <div>
-                    <p className="font-semibold text-[#142342]">
-                      Audited Adjustment ({adj.targetType.replace(/_/g, ' ')})
-                    </p>
-                    <p className="text-[#475569] mt-0.5">{adj.reason}</p>
-                  </div>
-                  <span className="font-mono font-bold text-amber-800 tabular-nums">
-                    {adj.deltaAmount >= 0 ? `+${formatINR(adj.deltaAmount)}` : `-${formatINR(Math.abs(adj.deltaAmount))}`}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* RECORD RECEIPT MODAL */}
       {receiptMemberId && (
-        <div className="fixed inset-0 z-50 bg-[#142342]/45 backdrop-blur-[2px] flex items-end sm:items-center justify-center p-0 sm:p-4" role="dialog" aria-modal="true" aria-label="Record Receipt">
-          <div className="w-full sm:max-w-lg bg-white rounded-t-2xl sm:rounded-2xl border border-[#E6E8EF] max-h-[92vh] flex flex-col overflow-hidden">
-            <div className="px-5 py-4 border-b border-[#E6E8EF] flex items-center justify-between">
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-[2px] flex items-end sm:items-center justify-center p-0 sm:p-4" role="dialog" aria-modal="true" aria-label="Record Receipt">
+          <div className="w-full sm:max-w-lg bg-[#18181a] rounded-t-lg sm:rounded-lg border border-[#f2efeb]/10 max-h-[92vh] flex flex-col overflow-hidden">
+            <div className="px-5 py-4 border-b border-[#f2efeb]/10 flex items-center justify-between">
               <div>
-                <h2 className="font-display text-base font-bold text-[#142342]">Record Member Receipt</h2>
-                <p className="text-xs text-[#64748B]">
+                <h2 className="font-display text-base font-bold text-[#f2efeb]">Record Member Receipt</h2>
+                <p className="text-xs text-[#f2efeb]/60">
                   {data.members.find((m) => m.id === receiptMemberId)?.name} · Supports partial or batch settlement
                 </p>
               </div>
-              <button type="button" onClick={() => setReceiptMemberId(null)} className="w-9 h-9 rounded-lg flex items-center justify-center text-[#64748B]">
+              <button type="button" onClick={() => setReceiptMemberId(null)} className="w-9 h-9 rounded-lg flex items-center justify-center text-[#f2efeb]/60">
                 <X className="w-4 h-4" />
               </button>
             </div>
             <form onSubmit={submitReceipt} className="p-5 overflow-y-auto space-y-3.5">
-              {error && <p className="p-2.5 rounded-lg bg-red-50 text-xs text-red-700">{error}</p>}
+              {error && <p className="p-2.5 rounded-lg bg-red-500/12 text-xs text-red-400">{error}</p>}
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Amount Received (₹) *</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Amount Received (₹) *</label>
                   <input
                     type="number"
                     required
                     min={1}
                     value={receiptAmount}
                     onChange={(e) => handleReceiptAmountAutoSplit(e.target.value)}
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] text-sm tabular-nums"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 text-sm tabular-nums"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Payment Date *</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Payment Date *</label>
                   <input
                     type="date"
                     required
                     value={receiptDate}
                     onChange={(e) => setReceiptDate(e.target.value)}
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] text-sm"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 text-sm"
                   />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Method</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Method</label>
                   <select
                     value={receiptMethod}
                     onChange={(e) => setReceiptMethod(e.target.value as PaymentMethod)}
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] bg-white text-sm"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 bg-[#18181a] text-sm"
                   >
                     <option value="UPI">UPI</option>
                     <option value="BANK_TRANSFER">Bank Transfer / NEFT</option>
@@ -1281,21 +1912,21 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">UTR / Reference *</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">UTR / Reference *</label>
                   <input
                     type="text"
                     required
                     value={receiptRef}
                     onChange={(e) => setReceiptRef(e.target.value)}
                     placeholder="e.g. UPI-884122"
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] text-sm font-mono"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 text-sm font-mono"
                   />
                 </div>
               </div>
 
               <div className="space-y-2">
-                <p className="text-xs font-semibold text-[#142342]">Itemized Meeting Allocation</p>
-                <div className="divide-y divide-[#E6E8EF] rounded-xl border border-[#E6E8EF] bg-[#F8F7FC]">
+                <p className="text-xs font-semibold text-[#f2efeb]">Itemized Meeting Allocation</p>
+                <div className="divide-y divide-[#f2efeb]/10 rounded-[6px] border border-[#f2efeb]/10 bg-[#1f1f23]">
                   {data.clientCharges
                     .filter((c) => c.memberId === receiptMemberId && c.status !== 'ON_HOLD' && c.amount > c.receivedAmount)
                     .map((c) => {
@@ -1303,10 +1934,10 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                       return (
                         <div key={c.id} className="p-3 flex items-center justify-between gap-2 text-xs">
                           <div className="min-w-0">
-                            <p className="font-semibold text-[#142342] truncate">
+                            <p className="font-semibold text-[#f2efeb] truncate">
                               {formatShortDate(c.meetingDate)} · {c.chapterName}
                             </p>
-                            <p className="text-[#64748B] tabular-nums">Remaining: {formatINR(rem)}</p>
+                            <p className="text-[#f2efeb]/60 tabular-nums">Remaining: {formatINR(rem)}</p>
                           </div>
                           <input
                             type="number"
@@ -1316,7 +1947,7 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                             onChange={(e) =>
                               setReceiptAllocs((prev) => ({ ...prev, [c.id]: Number(e.target.value) || 0 }))
                             }
-                            className="w-24 h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-right text-xs font-semibold tabular-nums"
+                            className="w-24 h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#18181a] text-right text-xs font-semibold tabular-nums"
                           />
                         </div>
                       );
@@ -1325,10 +1956,10 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
               </div>
 
               <div className="pt-2 flex justify-end gap-2">
-                <button type="button" onClick={() => setReceiptMemberId(null)} className="h-10 px-4 rounded-xl border border-[#E6E8EF] text-xs font-semibold">
+                <button type="button" onClick={() => setReceiptMemberId(null)} className="h-10 px-4 rounded-[6px] border border-[#f2efeb]/10 text-xs font-semibold">
                   Cancel
                 </button>
-                <button type="submit" disabled={busy} className="h-10 px-5 rounded-xl bg-[#6D28D9] text-white text-xs font-semibold inline-flex items-center gap-1.5">
+                <button type="submit" disabled={busy} className="h-10 px-5 rounded-[6px] bg-[#C81E2B] text-white text-xs font-semibold inline-flex items-center gap-1.5">
                   <CheckCircle2 className="w-4 h-4" />
                   Confirm Receipt
                 </button>
@@ -1340,51 +1971,51 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
 
       {/* RECORD PAYOUT MODAL (Supports Multi-Meeting Allocation + Optional Appreciation Bonus) */}
       {payoutSubId && (
-        <div className="fixed inset-0 z-50 bg-[#142342]/45 backdrop-blur-[2px] flex items-end sm:items-center justify-center p-0 sm:p-4" role="dialog" aria-modal="true" aria-label="Record Payout">
-          <div className="w-full sm:max-w-lg bg-white rounded-t-2xl sm:rounded-2xl border border-[#E6E8EF] max-h-[92vh] flex flex-col overflow-hidden">
-            <div className="px-5 py-4 border-b border-[#E6E8EF] flex items-center justify-between">
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-[2px] flex items-end sm:items-center justify-center p-0 sm:p-4" role="dialog" aria-modal="true" aria-label="Record Payout">
+          <div className="w-full sm:max-w-lg bg-[#18181a] rounded-t-lg sm:rounded-lg border border-[#f2efeb]/10 max-h-[92vh] flex flex-col overflow-hidden">
+            <div className="px-5 py-4 border-b border-[#f2efeb]/10 flex items-center justify-between">
               <div>
-                <h2 className="font-display text-base font-bold text-[#142342]">Record Substitute Payout</h2>
-                <p className="text-xs text-[#64748B]">
-                  Payee: {data.substitutes.find((s) => s.id === payoutSubId)?.name} (Registered Partner Only)
+                <h2 className="font-display text-base font-bold text-[#f2efeb]">Record Veloctive Team Payout</h2>
+                <p className="text-xs text-[#f2efeb]/60">
+                  Payee: {data.substitutes.find((s) => s.id === payoutSubId)?.name} (Veloctive Team Only)
                 </p>
               </div>
-              <button type="button" onClick={() => setPayoutSubId(null)} className="w-9 h-9 rounded-lg flex items-center justify-center text-[#64748B]">
+              <button type="button" onClick={() => setPayoutSubId(null)} className="w-9 h-9 rounded-lg flex items-center justify-center text-[#f2efeb]/60">
                 <X className="w-4 h-4" />
               </button>
             </div>
             <form onSubmit={submitPayout} className="p-5 overflow-y-auto space-y-3.5">
-              {error && <p className="p-2.5 rounded-lg bg-red-50 text-xs text-red-700">{error}</p>}
+              {error && <p className="p-2.5 rounded-lg bg-red-500/12 text-xs text-red-400">{error}</p>}
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Meeting Payout (₹) *</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Meeting Payout (₹) *</label>
                   <input
                     type="number"
                     required
                     min={0}
                     value={payoutAmount}
                     onChange={(e) => handlePayoutAmountAutoSplit(e.target.value)}
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] text-sm tabular-nums"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 text-sm tabular-nums"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Payment Date *</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Payment Date *</label>
                   <input
                     type="date"
                     required
                     value={payoutDate}
                     onChange={(e) => setPayoutDate(e.target.value)}
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] text-sm"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 text-sm"
                   />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Method</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Method</label>
                   <select
                     value={payoutMethod}
                     onChange={(e) => setPayoutMethod(e.target.value as PaymentMethod)}
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] bg-white text-sm"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 bg-[#18181a] text-sm"
                   >
                     <option value="UPI">UPI</option>
                     <option value="BANK_TRANSFER">Bank Transfer / IMPS</option>
@@ -1392,26 +2023,26 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Transfer Reference *</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Transfer Reference *</label>
                   <input
                     type="text"
                     required
                     value={payoutRef}
                     onChange={(e) => setPayoutRef(e.target.value)}
                     placeholder="e.g. IMPS-991042"
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] text-sm font-mono"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 text-sm font-mono"
                   />
                 </div>
               </div>
 
               {/* Optional Appreciation Bonus (Agency cost, NEVER billed to member!) */}
-              <div className="p-3.5 rounded-xl bg-[#F8F7FC] border border-[#E6E8EF] space-y-2.5">
+              <div className="p-3.5 rounded-[6px] bg-[#1f1f23] border border-[#f2efeb]/10 space-y-2.5">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-[#142342] inline-flex items-center gap-1.5">
-                    <Award className="w-4 h-4 text-[#B58F3D]" />
+                  <span className="text-xs font-bold text-[#f2efeb] inline-flex items-center gap-1.5">
+                    <Award className="w-4 h-4 text-[#E2B340]" />
                     Optional Appreciation Bonus
                   </span>
-                  <span className="text-[11px] text-[#64748B]">Agency cost only (never billed to member)</span>
+                  <span className="text-[11px] text-[#f2efeb]/60">Agency cost only (never billed to member)</span>
                 </div>
                 <div className="grid grid-cols-3 gap-2">
                   <input
@@ -1420,21 +2051,21 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                     value={bonusAmount}
                     onChange={(e) => setBonusAmount(e.target.value)}
                     placeholder="₹0"
-                    className="h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-xs tabular-nums"
+                    className="h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#18181a] text-xs tabular-nums"
                   />
                   <input
                     type="text"
                     value={bonusMessage}
                     onChange={(e) => setBonusMessage(e.target.value)}
                     placeholder="Gratitude note"
-                    className="col-span-2 h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-xs"
+                    className="col-span-2 h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#18181a] text-xs"
                   />
                 </div>
               </div>
 
               <div className="space-y-2">
-                <p className="text-xs font-semibold text-[#142342]">Itemized Meeting Allocation</p>
-                <div className="divide-y divide-[#E6E8EF] rounded-xl border border-[#E6E8EF] bg-[#F8F7FC]">
+                <p className="text-xs font-semibold text-[#f2efeb]">Itemized Meeting Allocation</p>
+                <div className="divide-y divide-[#f2efeb]/10 rounded-[6px] border border-[#f2efeb]/10 bg-[#1f1f23]">
                   {data.substituteEarnings
                     .filter((e) => e.payeeSubstituteId === payoutSubId && e.status !== 'ON_HOLD' && e.amount > e.paidAmount)
                     .map((e) => {
@@ -1442,10 +2073,10 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                       return (
                         <div key={e.id} className="p-3 flex items-center justify-between gap-2 text-xs">
                           <div className="min-w-0">
-                            <p className="font-semibold text-[#142342] truncate">
+                            <p className="font-semibold text-[#f2efeb] truncate">
                               {formatShortDate(e.meetingDate)} · {e.chapterName} ({e.actualAttendeeName})
                             </p>
-                            <p className="text-[#64748B] tabular-nums">Remaining: {formatINR(rem)}</p>
+                            <p className="text-[#f2efeb]/60 tabular-nums">Remaining: {formatINR(rem)}</p>
                           </div>
                           <input
                             type="number"
@@ -1455,7 +2086,7 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                             onChange={(ev) =>
                               setPayoutAllocs((prev) => ({ ...prev, [e.id]: Number(ev.target.value) || 0 }))
                             }
-                            className="w-24 h-9 px-2.5 rounded-lg border border-[#E6E8EF] bg-white text-right text-xs font-semibold tabular-nums"
+                            className="w-24 h-9 px-2.5 rounded-lg border border-[#f2efeb]/10 bg-[#18181a] text-right text-xs font-semibold tabular-nums"
                           />
                         </div>
                       );
@@ -1463,15 +2094,15 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                 </div>
               </div>
 
-              <div className="flex items-center justify-between pt-2 border-t border-[#E6E8EF]">
-                <span className="text-xs font-semibold text-[#142342] tabular-nums">
+              <div className="flex items-center justify-between pt-2 border-t border-[#f2efeb]/10">
+                <span className="text-xs font-semibold text-[#f2efeb] tabular-nums">
                   Total Transfer: {formatINR((Number(payoutAmount) || 0) + (Number(bonusAmount) || 0))}
                 </span>
                 <div className="flex gap-2">
-                  <button type="button" onClick={() => setPayoutSubId(null)} className="h-10 px-4 rounded-xl border border-[#E6E8EF] text-xs font-semibold">
+                  <button type="button" onClick={() => setPayoutSubId(null)} className="h-10 px-4 rounded-[6px] border border-[#f2efeb]/10 text-xs font-semibold">
                     Cancel
                   </button>
-                  <button type="submit" disabled={busy} className="h-10 px-5 rounded-xl bg-[#6D28D9] text-white text-xs font-semibold cursor-pointer">
+                  <button type="submit" disabled={busy} className="h-10 px-5 rounded-[6px] bg-[#C81E2B] text-white text-xs font-semibold cursor-pointer">
                     Confirm Payout
                   </button>
                 </div>
@@ -1483,24 +2114,24 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
 
       {/* RECORD COMMISSION PAYOUT MODAL (Super Admin Only) */}
       {commTarget && isAdmin && (
-        <div className="fixed inset-0 z-50 bg-[#142342]/45 backdrop-blur-[2px] flex items-end sm:items-center justify-center p-0 sm:p-4" role="dialog" aria-modal="true" aria-label="Pay coordinator commission">
-          <div className="w-full sm:max-w-md bg-white rounded-t-2xl sm:rounded-2xl border border-[#E6E8EF] overflow-hidden">
-            <div className="px-5 py-4 border-b border-[#E6E8EF] flex items-center justify-between">
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-[2px] flex items-end sm:items-center justify-center p-0 sm:p-4" role="dialog" aria-modal="true" aria-label="Pay coordinator commission">
+          <div className="w-full sm:max-w-md bg-[#18181a] rounded-t-lg sm:rounded-lg border border-[#f2efeb]/10 overflow-hidden">
+            <div className="px-5 py-4 border-b border-[#f2efeb]/10 flex items-center justify-between">
               <div>
-                <h2 className="font-display text-base font-bold text-[#142342]">Pay Approved Commission</h2>
-                <p className="text-xs text-[#64748B]">
+                <h2 className="font-display text-base font-bold text-[#f2efeb]">Pay Approved Commission</h2>
+                <p className="text-xs text-[#f2efeb]/60">
                   {coordName(commTarget.coordinatorId)} · {commTarget.chapterName} ({formatShortDate(commTarget.meetingDate)})
                 </p>
               </div>
-              <button type="button" onClick={() => setCommTarget(null)} className="w-9 h-9 rounded-lg flex items-center justify-center text-[#64748B]">
+              <button type="button" onClick={() => setCommTarget(null)} className="w-9 h-9 rounded-lg flex items-center justify-center text-[#f2efeb]/60">
                 <X className="w-4 h-4" />
               </button>
             </div>
             <form onSubmit={submitCommissionPayout} className="p-5 space-y-3.5">
-              {error && <p className="p-2.5 rounded-lg bg-red-50 text-xs text-red-700">{error}</p>}
+              {error && <p className="p-2.5 rounded-lg bg-red-500/12 text-xs text-red-400">{error}</p>}
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Amount (₹) *</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Amount (₹) *</label>
                   <input
                     type="number"
                     required
@@ -1508,27 +2139,27 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                     max={commTarget.amount - commTarget.paidAmount}
                     value={commPayAmt}
                     onChange={(e) => setCommPayAmt(e.target.value)}
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] text-sm tabular-nums"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 text-sm tabular-nums"
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Payment Date *</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Payment Date *</label>
                   <input
                     type="date"
                     required
                     value={commPayDate}
                     onChange={(e) => setCommPayDate(e.target.value)}
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] text-sm"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 text-sm"
                   />
                 </div>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Method</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Method</label>
                   <select
                     value={commPayMethod}
                     onChange={(e) => setCommPayMethod(e.target.value as PaymentMethod)}
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] bg-white text-sm"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 bg-[#18181a] text-sm"
                   >
                     <option value="UPI">UPI</option>
                     <option value="BANK_TRANSFER">Bank Transfer</option>
@@ -1536,22 +2167,22 @@ export const FinanceView: React.FC<FinanceViewProps> = ({
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-semibold text-[#142342] mb-1">Reference *</label>
+                  <label className="block text-xs font-semibold text-[#f2efeb] mb-1">Reference *</label>
                   <input
                     type="text"
                     required
                     value={commPayRef}
                     onChange={(e) => setCommPayRef(e.target.value)}
                     placeholder="UPI / IMPS ref"
-                    className="w-full h-10 px-3 rounded-xl border border-[#E6E8EF] text-sm font-mono"
+                    className="w-full h-10 px-3 rounded-[6px] border border-[#f2efeb]/10 text-sm font-mono"
                   />
                 </div>
               </div>
               <div className="flex justify-end gap-2 pt-2">
-                <button type="button" onClick={() => setCommTarget(null)} className="h-10 px-4 rounded-xl border border-[#E6E8EF] text-xs font-semibold">
+                <button type="button" onClick={() => setCommTarget(null)} className="h-10 px-4 rounded-[6px] border border-[#f2efeb]/10 text-xs font-semibold">
                   Cancel
                 </button>
-                <button type="submit" disabled={busy} className="h-10 px-5 rounded-xl bg-[#6D28D9] text-white text-xs font-semibold cursor-pointer">
+                <button type="submit" disabled={busy} className="h-10 px-5 rounded-[6px] bg-[#C81E2B] text-white text-xs font-semibold cursor-pointer">
                   Confirm Commission Payout
                 </button>
               </div>

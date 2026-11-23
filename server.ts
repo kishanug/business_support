@@ -1,12 +1,22 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import http from 'node:http';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { createServer as createViteServer } from 'vite';
-import { AgencyStore, DomainError } from './src/core/store';
-import type { Namespace, SessionUser } from './src/core/types';
+import { isSmtpConfigured, sendSuperAdminResetEmail } from './src/core/mailer.ts';
+import { AgencyStore, DomainError } from './src/core/store.ts';
+import type { Namespace, SessionUser } from './src/core/types.ts';
 
-const PORT = Number(process.env.PORT || 3000);
+function readCliFlag(flag: string): string | undefined {
+  const idx = process.argv.indexOf(flag);
+  if (idx !== -1 && idx + 1 < process.argv.length) return process.argv[idx + 1];
+  const prefix = `${flag}=`;
+  const found = process.argv.find((a) => a.startsWith(prefix));
+  return found ? found.slice(prefix.length) : undefined;
+}
+
+const PORT = Number(readCliFlag('--port') || process.env.PORT || 3000);
+const HOST = readCliFlag('--host') || '0.0.0.0';
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
 const store = new AgencyStore();
@@ -81,7 +91,14 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): voi
 
 function handleError(err: unknown, res: Response): void {
   if (err instanceof DomainError) {
-    res.status(err.status).json({ code: err.code, error: err.message });
+    if (err.status === 429 && err.retryAfterSeconds) {
+      res.setHeader('Retry-After', String(err.retryAfterSeconds));
+    }
+    res.status(err.status).json({
+      code: err.code,
+      error: err.message,
+      ...(err.retryAfterSeconds ? { retryAfterSeconds: err.retryAfterSeconds } : {}),
+    });
     return;
   }
   console.error('[AgencyOS API Error]', err);
@@ -92,24 +109,34 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
-  // ==================== PUBLIC AUTH ROUTES ====================
+  // ==================== PUBLIC AUTH & HEALTH ROUTES ====================
+
+  app.get('/health', (_req, res) => {
+    res.status(200).json({ ok: true });
+  });
 
   app.get('/api/auth/status', (_req, res) => {
     res.json({
       workspaceInitialized: store.hasWorkspaceAdmin(),
+      superAdminPasswordConfigured: store.isSuperAdminPasswordConfigured(),
+      smtpConfigured: isSmtpConfigured(),
       supabaseConnected: false,
       environmentMode: 'LOCAL_SANDBOX_WITH_ISOLATED_DEMO',
     });
   });
 
-  app.post('/api/auth/bootstrap-admin', (req, res) => {
-    try {
-      const user = store.bootstrapWorkspaceAdmin(req.body);
-      const token = signToken(user);
-      res.status(201).json({ token, user });
-    } catch (err) {
-      handleError(err, res);
-    }
+  app.get('/api/auth/login-accounts', (_req, res) => {
+    res.json({
+      accounts: store.getLoginQuickFillAccounts(),
+    });
+  });
+
+  app.post('/api/auth/bootstrap-admin', (_req, res) => {
+    res.status(403).json({
+      code: 'PUBLIC_ADMIN_SIGNUP_DISABLED',
+      error:
+        'Public Super Admin signup is disabled. Only the authorized owner email may access Super Admin and reset its password via email.',
+    });
   });
 
   app.post('/api/auth/login', (req, res) => {
@@ -137,10 +164,45 @@ async function startServer() {
     }
   });
 
-  app.post('/api/auth/forgot-password', (req, res) => {
+  app.post('/api/auth/forgot-password', async (req, res) => {
+    const rawEmail = String(req.body?.email || '');
     try {
-      const result = store.requestPasswordReset(String(req.body?.email || ''));
-      res.json(result);
+      const result = store.requestSuperAdminPasswordReset(rawEmail);
+      if (result.shouldSendEmail && result.toEmail && result.resetCode) {
+        if (!isSmtpConfigured()) {
+          store.rollbackPendingPasswordReset(result.toEmail);
+          res.status(503).json({
+            code: 'SMTP_NOT_CONFIGURED',
+            error:
+              'SMTP email is not configured on the server yet. Add SMTP_USER and SMTP_PASS (Gmail App Password) in Settings → Secrets to email Super Admin reset codes.',
+          });
+          return;
+        }
+        const appBase = (process.env.APP_URL || '').trim().replace(/\/+$/, '');
+        const resetUrl =
+          appBase && /^https?:\/\//i.test(appBase)
+            ? `${appBase}/?resetEmail=${encodeURIComponent(result.toEmail)}&resetCode=${encodeURIComponent(result.resetCode)}`
+            : undefined;
+        try {
+          await sendSuperAdminResetEmail({
+            toEmail: result.toEmail,
+            resetCode: result.resetCode,
+            resetUrl,
+            expiresMinutes: result.expiresMinutes,
+          });
+        } catch (mailErr) {
+          store.rollbackPendingPasswordReset(result.toEmail);
+          console.error('[AgencyOS SMTP Error]', mailErr);
+          res.status(502).json({
+            code: 'SMTP_DELIVERY_FAILED',
+            error:
+              'Failed to deliver password reset email via SMTP. Verify SMTP_HOST, SMTP_PORT, SMTP_USER, and Gmail App Password (SMTP_PASS) in Secrets.',
+          });
+          return;
+        }
+      }
+      // Never return the reset code in HTTP responses
+      res.json({ message: result.message });
     } catch (err) {
       handleError(err, res);
     }
@@ -172,11 +234,30 @@ async function startServer() {
     res.json({ ok: true });
   });
 
+  app.post('/api/auth/change-password', requireAuth, (req: AuthedRequest, res) => {
+    try {
+      const { currentPassword, newPassword } = req.body ?? {};
+      store.changeOwnPassword(req.actor!, String(currentPassword || ''), String(newPassword || ''));
+      res.json({ ok: true });
+    } catch (err) {
+      handleError(err, res);
+    }
+  });
+
   // ==================== PROTECTED WORKSPACE ROUTES ====================
 
   app.get('/api/bootstrap', requireAuth, (req: AuthedRequest, res) => {
     try {
       res.json(store.getBootstrapPayload(req.actor!));
+    } catch (err) {
+      handleError(err, res);
+    }
+  });
+
+  app.patch('/api/me/profile', requireAuth, (req: AuthedRequest, res) => {
+    try {
+      const result = store.updateMyProfile(req.actor!, req.body ?? {});
+      res.json(result);
     } catch (err) {
       handleError(err, res);
     }
@@ -235,6 +316,15 @@ async function startServer() {
   app.patch('/api/users/:id/status', requireAuth, (req: AuthedRequest, res) => {
     try {
       store.setUserActiveStatus(req.actor!, String(req.params.id), Boolean(req.body?.active));
+      res.json({ ok: true });
+    } catch (err) {
+      handleError(err, res);
+    }
+  });
+
+  app.patch('/api/users/:id/show-on-login', requireAuth, (req: AuthedRequest, res) => {
+    try {
+      store.setUserShowOnLogin(req.actor!, String(req.params.id), Boolean(req.body?.showOnLogin));
       res.json({ ok: true });
     } catch (err) {
       handleError(err, res);
@@ -307,6 +397,26 @@ async function startServer() {
     }
   });
 
+  app.patch('/api/requests/:id/referral-ask', requireAuth, (req: AuthedRequest, res) => {
+    try {
+      const rawType = req.body?.memberNoteType;
+      const validType =
+        rawType === 'GENERAL_NOTE' || rawType === 'REFERRAL_ROUND' || rawType === 'SPECIAL_INSTRUCTION'
+          ? rawType
+          : undefined;
+      res.json(
+        store.updateRequestReferralAsk(
+          req.actor!,
+          String(req.params.id),
+          String(req.body?.referralAsk || ''),
+          validType
+        )
+      );
+    } catch (err) {
+      handleError(err, res);
+    }
+  });
+
   app.post('/api/requests/:id/respond', requireAuth, (req: AuthedRequest, res) => {
     try {
       res.json(store.submitResponse(req.actor!, String(req.params.id), req.body));
@@ -355,10 +465,18 @@ async function startServer() {
     }
   });
 
-  // Check-ins, Finish, Disputes & Verification
+  // Check-ins, Issue Alert, Finish, Disputes & Verification
   app.post('/api/assignments/:id/checkin', requireAuth, (req: AuthedRequest, res) => {
     try {
       res.json(store.recordCheckin(req.actor!, String(req.params.id), req.body?.eventType, req.body?.note));
+    } catch (err) {
+      handleError(err, res);
+    }
+  });
+
+  app.post('/api/assignments/:id/issue', requireAuth, (req: AuthedRequest, res) => {
+    try {
+      res.json(store.reportAssignmentIssue(req.actor!, String(req.params.id), String(req.body?.note || '')));
     } catch (err) {
       handleError(err, res);
     }
@@ -451,11 +569,21 @@ async function startServer() {
     }
   });
 
+  const httpServer = http.createServer(app);
+
   // Mount Vite middleware in dev or serve dist in prod
   const isProd = process.env.NODE_ENV === 'production';
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        ...(hmrDisabled
+          ? { hmr: false, ws: false, watch: null }
+          : { hmr: { server: httpServer } }),
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -467,9 +595,12 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`AgencyOS server listening on http://localhost:${PORT}`);
+  httpServer.listen(PORT, HOST, () => {
+    console.log(`AgencyOS server listening on http://${HOST}:${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('[AgencyOS] Failed to start server:', err);
+  process.exit(1);
+});

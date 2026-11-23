@@ -11,6 +11,8 @@ export type Weekday =
   | 'Saturday'
   | 'Sunday';
 
+export type MemberNoteType = 'GENERAL_NOTE' | 'REFERRAL_ROUND' | 'SPECIAL_INSTRUCTION';
+
 export type AssignmentMode = 'MULTI_INTEREST' | 'FIRST_CONFIRM' | 'DIRECT';
 
 export type RequestStatus =
@@ -88,6 +90,11 @@ export interface UserAccount {
   invitedBy?: string;
   inviteToken?: string;
   resetToken?: string;
+  resetTokenHash?: string;
+  resetTokenExpiresAt?: number;
+  resetFailedAttempts?: number;
+  passwordConfigured?: boolean;
+  showOnLogin?: boolean;
   createdAt: string;
 }
 
@@ -245,6 +252,8 @@ export interface MeetingRequest {
   startTime: string;
   endTime: string;
   intro30SecSnapshot: string;
+  memberNoteType?: MemberNoteType;
+  referralAskSnapshot?: string;
   memberNameSnapshot: string;
   memberBusinessSnapshot: string;
   memberPhoneSnapshot: string;
@@ -275,6 +284,10 @@ export interface RequestResponse {
   delegatedGuestId?: string;
   delegatedGuestName?: string;
   note?: string;
+  isCrossMeetingRequest?: boolean;
+  crossMeetingConflictAssignmentId?: string;
+  crossMeetingConflictChapter?: string;
+  crossMeetingConflictTime?: string;
   status: ResponseStatus;
   createdAt: string;
   updatedAt: string;
@@ -324,6 +337,10 @@ export interface Assignment {
   finishedByUserId?: string;
   finishedReportedByPartner: boolean;
   meetingNotes?: MeetingReportNotes;
+  issueNote?: string;
+  issueReportedAt?: string;
+  isCrossMeeting?: boolean;
+  crossMeetingApprovedByUserId?: string;
   verifiedAt?: string;
   verifiedByUserId?: string;
   disputed: boolean;
@@ -499,7 +516,7 @@ export interface NotificationItem {
   recipientUserId: string;
   title: string;
   body: string;
-  category: 'REQUEST' | 'ASSIGNMENT' | 'CHECKIN' | 'FINANCE' | 'DISPUTE' | 'MILESTONE';
+  category: 'REQUEST' | 'ASSIGNMENT' | 'CHECKIN' | 'FINANCE' | 'DISPUTE' | 'MILESTONE' | 'ISSUE';
   read: boolean;
   relatedId?: string;
   createdAt: string;
@@ -560,5 +577,10 @@ export interface PublicOpenRequestCard {
   coordinatorWhatsappPhone: string;
   myResponse?: RequestResponse;
   myAssignmentId?: string;
+  sameDateSelfConflict?: {
+    assignmentId: string;
+    chapterName: string;
+    reportingTime: string;
+  };
   // NOTE: memberName, memberPhone, intro30Sec, memberBusiness, exact address/maps are intentionally OMITTED until confirmed!
 }

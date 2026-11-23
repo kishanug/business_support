@@ -14,7 +14,9 @@ import type {
   MeetingReportNotes,
   MeetingRequest,
   Member,
+  MemberNoteType,
   MessageDeliveryState,
+  MessageLog,
   Namespace,
   PartnerGuestContact,
   PaymentMethod,
@@ -29,37 +31,227 @@ import type {
   Substitute,
   SubstituteEarning,
   UserAccount,
-} from './types';
+} from './types.ts';
 import {
   computeFinanceSummary,
   computeMilestoneProgress,
+  formatShortDate,
+  getMemberNoteTypeLabel,
   getTomorrowInKolkata,
   MILESTONE_TARGETS,
   resolveRequestAutoFill,
-} from './rules';
-import { createDemoDataset, createEmptyDataset, DomainDataset, hashPassword, verifyPassword } from './seed';
+} from './rules.ts';
+import {
+  createDemoDataset,
+  createEmptyDataset,
+  type DomainDataset,
+  hashPassword,
+  verifyPassword,
+} from './seed.ts';
+
+export const DEFAULT_SUPER_ADMIN_EMAIL = 'kishanus03@gmail.com';
+export const MAX_FAILED_LOGIN_ATTEMPTS = 5;
+export const LOGIN_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
+export const RESET_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes
+export const MAX_RESET_VERIFY_ATTEMPTS = 5;
+export const MAX_RESET_REQUESTS_PER_WINDOW = 5;
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export function normalizeEmail(raw: string): string {
+  return (raw || '').trim().toLowerCase();
+}
+
+function hashResetCode(code: string): string {
+  return crypto.createHash('sha256').update(code.trim().toUpperCase()).digest('hex');
+}
+
+function timingSafeHexEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+interface LoginAttemptRecord {
+  count: number;
+  lockedUntil: number;
+  firstAttemptAt: number;
+}
+
+interface ResetRequestRateRecord {
+  count: number;
+  windowStart: number;
+}
 
 export class DomainError extends Error {
   status: number;
   code: string;
-  constructor(status: number, code: string, message: string) {
+  retryAfterSeconds?: number;
+  constructor(status: number, code: string, message: string, retryAfterSeconds?: number) {
     super(message);
     this.status = status;
     this.code = code;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
+}
+
+export interface AgencyStoreOptions {
+  superAdminEmail?: string;
+  superAdminPassword?: string;
 }
 
 export class AgencyStore {
   private datasets: Record<Namespace, DomainDataset>;
   private activeLocks = new Set<string>();
+  private loginAttempts = new Map<string, LoginAttemptRecord>();
+  private resetRequestRates = new Map<string, ResetRequestRateRecord>();
   private referenceDateProvider: () => Date;
+  private superAdminEmail: string;
 
-  constructor(referenceDateProvider: () => Date = () => new Date()) {
+  constructor(
+    referenceDateProvider: () => Date = () => new Date(),
+    options: AgencyStoreOptions = {}
+  ) {
     this.referenceDateProvider = referenceDateProvider;
+    const configuredEmail = normalizeEmail(
+      options.superAdminEmail ?? process.env.SUPER_ADMIN_EMAIL ?? DEFAULT_SUPER_ADMIN_EMAIL
+    );
+    this.superAdminEmail = EMAIL_REGEX.test(configuredEmail)
+      ? configuredEmail
+      : DEFAULT_SUPER_ADMIN_EMAIL;
+
     this.datasets = {
       demo: createDemoDataset(referenceDateProvider()),
       workspace: createEmptyDataset(),
     };
+
+    const initialAdminPassword =
+      options.superAdminPassword !== undefined
+        ? options.superAdminPassword
+        : process.env.SUPER_ADMIN_PASSWORD;
+    const prehashedHash =
+      options.superAdminPassword === undefined ? process.env.SUPER_ADMIN_PASSWORD_HASH : undefined;
+    const prehashedSalt =
+      options.superAdminPassword === undefined ? process.env.SUPER_ADMIN_PASSWORD_SALT : undefined;
+    this.ensureLockedWorkspaceSuperAdmin(initialAdminPassword, prehashedHash, prehashedSalt);
+  }
+
+  private ensureLockedWorkspaceSuperAdmin(
+    initialPassword?: string,
+    prehashedHash?: string,
+    prehashedSalt?: string
+  ): void {
+    const data = this.datasets.workspace;
+    if (data.users.some((u) => u.role === 'SUPER_ADMIN')) return;
+
+    const now = this.now();
+    const hasPlainPw = Boolean(initialPassword && initialPassword.length >= 8);
+    const hasPrehashed = Boolean(
+      !hasPlainPw && prehashedHash && prehashedSalt && prehashedHash.length >= 64 && prehashedSalt.length >= 16
+    );
+    const hasConfiguredPw = hasPlainPw || hasPrehashed;
+
+    let hash: string;
+    let salt: string;
+    if (hasPlainPw) {
+      const hashed = hashPassword(initialPassword!);
+      hash = hashed.hash;
+      salt = hashed.salt;
+    } else if (hasPrehashed) {
+      hash = prehashedHash!.trim();
+      salt = prehashedSalt!.trim();
+    } else {
+      const hashed = hashPassword(crypto.randomBytes(32).toString('hex'));
+      hash = hashed.hash;
+      salt = hashed.salt;
+    }
+
+    const userId = 'usr-ws-superadmin';
+    const coordId = 'coord-ws-superadmin';
+
+    data.users.push({
+      id: userId,
+      namespace: 'workspace',
+      email: this.superAdminEmail,
+      passwordHash: hash,
+      passwordSalt: salt,
+      displayName: 'Kishan',
+      role: 'SUPER_ADMIN',
+      coordinatorId: coordId,
+      canManageNetwork: false,
+      active: true,
+      passwordConfigured: hasConfiguredPw,
+      createdAt: now,
+    });
+
+    data.coordinators.push({
+      id: coordId,
+      namespace: 'workspace',
+      userId,
+      name: 'Kishan',
+      email: this.superAdminEmail,
+      callingPhone: '9820000001',
+      whatsappPhone: '9820000001',
+      region: 'Mumbai HQ',
+      isSuperAdmin: true,
+      defaultMemberFee: 500,
+      defaultSubstitutePayout: 350,
+      active: true,
+      createdAt: now,
+    });
+  }
+
+  public getSuperAdminEmail(): string {
+    return this.superAdminEmail;
+  }
+
+  public isSuperAdminPasswordConfigured(): boolean {
+    const admin = this.ds('workspace').users.find(
+      (u) => u.role === 'SUPER_ADMIN' && u.email.toLowerCase() === this.superAdminEmail
+    );
+    return Boolean(admin?.passwordConfigured);
+  }
+
+  private assertEmailUnique(namespace: Namespace, rawEmail: string, excludeUserId?: string): string {
+    const email = normalizeEmail(rawEmail);
+    if (!email || !EMAIL_REGEX.test(email)) {
+      throw new DomainError(400, 'INVALID_EMAIL', 'Please enter a valid email address.');
+    }
+    const data = this.ds(namespace);
+    const conflictUser = data.users.find(
+      (u) => u.id !== excludeUserId && normalizeEmail(u.email) === email
+    );
+    const conflictCoord = data.coordinators.find(
+      (c) => c.userId !== excludeUserId && normalizeEmail(c.email) === email
+    );
+    const conflictSub = data.substitutes.find(
+      (s) => s.userId !== excludeUserId && normalizeEmail(s.email) === email
+    );
+    if (conflictUser || conflictCoord || conflictSub) {
+      throw new DomainError(
+        409,
+        'EMAIL_EXISTS',
+        `The email address "${email}" is already in use by another account. Each account must use a unique login email.`
+      );
+    }
+    if (email === this.superAdminEmail) {
+      const ownUser = excludeUserId
+        ? data.users.find((u) => u.id === excludeUserId && u.role === 'SUPER_ADMIN')
+        : undefined;
+      if (!ownUser) {
+        throw new DomainError(
+          409,
+          'EMAIL_RESERVED',
+          'This email address is reserved exclusively for the Super Admin account.'
+        );
+      }
+    }
+    return email;
+  }
+
+  private clearLoginAttempts(namespace: Namespace, email: string): void {
+    this.loginAttempts.delete(`${namespace}:${normalizeEmail(email)}`);
   }
 
   public resetDemo(): void {
@@ -188,7 +380,7 @@ export class AgencyStore {
     recipientUserId: string,
     title: string,
     body: string,
-    category: 'REQUEST' | 'ASSIGNMENT' | 'CHECKIN' | 'FINANCE' | 'DISPUTE' | 'MILESTONE',
+    category: 'REQUEST' | 'ASSIGNMENT' | 'CHECKIN' | 'FINANCE' | 'DISPUTE' | 'MILESTONE' | 'ISSUE',
     relatedId?: string
   ): void {
     this.ds(ns).notifications.unshift({
@@ -211,75 +403,93 @@ export class AgencyStore {
   }
 
   /**
-   * First-run atomic admin bootstrap for the local workspace sandbox when no admin exists yet.
+   * Public Super Admin signup from the Login page is permanently disabled.
+   * Only the sole authorized Super Admin email (kishanus03@gmail.com) may hold Super Admin access
+   * and reset their password via SMTP email.
    */
-  public bootstrapWorkspaceAdmin(input: {
+  public bootstrapWorkspaceAdmin(_input: {
     email: string;
     password: string;
     displayName: string;
     callingPhone: string;
     whatsappPhone?: string;
   }): SessionUser {
-    const data = this.ds('workspace');
-    if (this.hasWorkspaceAdmin()) {
-      throw new DomainError(409, 'ALREADY_BOOTSTRAPPED', 'Workspace admin has already been initialized.');
-    }
-    const email = input.email.trim().toLowerCase();
-    if (!email || !email.includes('@')) {
-      throw new DomainError(400, 'INVALID_EMAIL', 'Please enter a valid email address.');
-    }
-    if (!input.password || input.password.length < 8) {
-      throw new DomainError(400, 'WEAK_PASSWORD', 'Password must be at least 8 characters.');
-    }
-    const { hash, salt } = hashPassword(input.password);
-    const userId = this.id('usr');
-    const coordId = this.id('coord');
-    const now = this.now();
-
-    const user: UserAccount = {
-      id: userId,
-      namespace: 'workspace',
-      email,
-      passwordHash: hash,
-      passwordSalt: salt,
-      displayName: input.displayName.trim() || 'Super Admin',
-      role: 'SUPER_ADMIN',
-      coordinatorId: coordId,
-      canManageNetwork: false,
-      active: true,
-      createdAt: now,
-    };
-    data.users.push(user);
-    data.coordinators.push({
-      id: coordId,
-      namespace: 'workspace',
-      userId,
-      name: user.displayName,
-      email,
-      callingPhone: input.callingPhone.trim() || '9820000001',
-      whatsappPhone: (input.whatsappPhone || input.callingPhone).trim() || '9820000001',
-      region: 'Primary Workspace',
-      isSuperAdmin: true,
-      defaultMemberFee: 500,
-      defaultSubstitutePayout: 350,
-      active: true,
-      createdAt: now,
-    });
-    return this.resolveActiveActor('workspace', userId);
+    throw new DomainError(
+      403,
+      'PUBLIC_ADMIN_SIGNUP_DISABLED',
+      `Public Super Admin signup is disabled. Only ${this.superAdminEmail} is authorized as Super Admin and may set or reset their password via email.`
+    );
   }
 
   /**
-   * Namespace-scoped password sign-in (strictly isolated by namespace).
+   * Namespace-scoped password sign-in with strict 5-attempt / 15-minute lockout protection.
    */
   public loginWithPassword(namespace: Namespace, email: string, password: string): SessionUser {
-    const normalized = email.trim().toLowerCase();
-    const user = this.ds(namespace).users.find((u) => u.email.toLowerCase() === normalized);
-    if (!user || !verifyPassword(password, user.passwordHash, user.passwordSalt)) {
-      throw new DomainError(401, 'INVALID_CREDENTIALS', 'Invalid email or password.');
+    const normalized = normalizeEmail(email);
+    const nowMs = this.referenceDateProvider().getTime();
+    const attemptKey = `${namespace}:${normalized}`;
+    const existingRecord = this.loginAttempts.get(attemptKey);
+
+    if (existingRecord && existingRecord.lockedUntil > nowMs) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((existingRecord.lockedUntil - nowMs) / 1000));
+      const minsLeft = Math.max(1, Math.ceil(retryAfterSeconds / 60));
+      throw new DomainError(
+        429,
+        'ACCOUNT_LOCKED',
+        `Too many invalid password attempts. Login is temporarily locked for ${minsLeft} more minute${minsLeft === 1 ? '' : 's'}.`,
+        retryAfterSeconds
+      );
     }
+
+    // Clear expired lockout window
+    if (existingRecord && existingRecord.lockedUntil > 0 && existingRecord.lockedUntil <= nowMs) {
+      this.loginAttempts.delete(attemptKey);
+    }
+
+    const user = this.ds(namespace).users.find((u) => normalizeEmail(u.email) === normalized);
+    const validPassword =
+      Boolean(user) &&
+      user!.passwordConfigured !== false &&
+      verifyPassword(password, user!.passwordHash, user!.passwordSalt);
+
+    if (!user || !validPassword) {
+      const current = this.loginAttempts.get(attemptKey);
+      const withinWindow = current && nowMs - current.firstAttemptAt < LOGIN_LOCKOUT_MS;
+      const nextCount = withinWindow ? current.count + 1 : 1;
+
+      if (nextCount >= MAX_FAILED_LOGIN_ATTEMPTS) {
+        this.loginAttempts.set(attemptKey, {
+          count: nextCount,
+          lockedUntil: nowMs + LOGIN_LOCKOUT_MS,
+          firstAttemptAt: withinWindow ? current.firstAttemptAt : nowMs,
+        });
+        const retryAfterSeconds = Math.ceil(LOGIN_LOCKOUT_MS / 1000);
+        throw new DomainError(
+          429,
+          'ACCOUNT_LOCKED',
+          'Too many invalid password attempts (5 of 5). Login is locked for 15 minutes.',
+          retryAfterSeconds
+        );
+      }
+
+      this.loginAttempts.set(attemptKey, {
+        count: nextCount,
+        lockedUntil: 0,
+        firstAttemptAt: withinWindow ? current.firstAttemptAt : nowMs,
+      });
+      const remaining = MAX_FAILED_LOGIN_ATTEMPTS - nextCount;
+      throw new DomainError(
+        401,
+        'INVALID_CREDENTIALS',
+        `Invalid email or password. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining before a 15-minute lockout.`
+      );
+    }
+
     if (!user.active) {
       throw new DomainError(403, 'ACCOUNT_DEACTIVATED', 'This account has been deactivated.');
     }
+
+    this.loginAttempts.delete(attemptKey);
     return this.resolveActiveActor(namespace, user.id);
   }
 
@@ -306,35 +516,153 @@ export class AgencyStore {
     return this.resolveActiveActor('demo', userId);
   }
 
-  public requestPasswordReset(email: string): { resetToken?: string; message: string } {
-    const normalized = email.trim().toLowerCase();
-    const user = this.ds('workspace').users.find((u) => u.email.toLowerCase() === normalized && u.active);
-    if (!user) {
-      return { message: 'If an active invited account matches that email, a reset token has been generated.' };
+  /**
+   * Self-service password reset is restricted STRICTLY to the sole Super Admin email.
+   * Never returns the reset code to untrusted clients; server.ts delivers it via SMTP email only.
+   */
+  public requestSuperAdminPasswordReset(email: string): {
+    shouldSendEmail: boolean;
+    toEmail?: string;
+    resetCode?: string;
+    expiresMinutes: number;
+    message: string;
+  } {
+    const normalized = normalizeEmail(email);
+    if (!normalized || !EMAIL_REGEX.test(normalized)) {
+      throw new DomainError(400, 'INVALID_EMAIL', 'Enter a valid email address.');
     }
-    const token = crypto.randomBytes(12).toString('hex');
-    user.resetToken = token;
+
+    const nowMs = this.referenceDateProvider().getTime();
+    const rate = this.resetRequestRates.get(normalized);
+    if (rate && nowMs - rate.windowStart < LOGIN_LOCKOUT_MS) {
+      if (rate.count >= MAX_RESET_REQUESTS_PER_WINDOW) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((rate.windowStart + LOGIN_LOCKOUT_MS - nowMs) / 1000));
+        throw new DomainError(
+          429,
+          'TOO_MANY_RESET_REQUESTS',
+          'Too many password reset requests. Please wait 15 minutes before trying again.',
+          retryAfterSeconds
+        );
+      }
+      rate.count += 1;
+    } else {
+      this.resetRequestRates.set(normalized, { count: 1, windowStart: nowMs });
+    }
+
+    // Only the sole Super Admin email may self-reset via email.
+    // External Coordinators & Substitutes must ask the Super Admin to reset their password.
+    const admin = this.ds('workspace').users.find(
+      (u) =>
+        u.role === 'SUPER_ADMIN' &&
+        u.active &&
+        normalizeEmail(u.email) === this.superAdminEmail &&
+        normalizeEmail(u.email) === normalized
+    );
+
+    if (!admin) {
+      return {
+        shouldSendEmail: false,
+        expiresMinutes: 15,
+        message:
+          'If this matches the authorized Super Admin email, a password reset code has been sent. External Coordinators and Substitutes must ask the Super Admin to reset their password.',
+      };
+    }
+
+    const resetCode = crypto.randomBytes(4).toString('hex').toUpperCase();
+    admin.resetTokenHash = hashResetCode(resetCode);
+    admin.resetTokenExpiresAt = nowMs + RESET_TOKEN_TTL_MS;
+    admin.resetFailedAttempts = 0;
+    admin.resetToken = undefined;
+
     return {
-      resetToken: token,
-      message: 'Password reset token generated in local sandbox.',
+      shouldSendEmail: true,
+      toEmail: admin.email,
+      resetCode,
+      expiresMinutes: 15,
+      message: `A 15-minute password reset code has been sent to ${admin.email}.`,
     };
   }
 
-  public completePasswordReset(email: string, token: string, newPassword: string): void {
+  public rollbackPendingPasswordReset(email: string): void {
+    const normalized = normalizeEmail(email);
+    const user = this.ds('workspace').users.find((u) => normalizeEmail(u.email) === normalized);
+    if (user) {
+      user.resetTokenHash = undefined;
+      user.resetTokenExpiresAt = undefined;
+      user.resetFailedAttempts = 0;
+      user.resetToken = undefined;
+    }
+  }
+
+  public completePasswordReset(email: string, codeOrToken: string, newPassword: string): void {
     if (!newPassword || newPassword.length < 8) {
       throw new DomainError(400, 'WEAK_PASSWORD', 'New password must be at least 8 characters.');
     }
-    const normalized = email.trim().toLowerCase();
-    const user = this.ds('workspace').users.find(
-      (u) => u.email.toLowerCase() === normalized && u.resetToken && u.resetToken === token
-    );
-    if (!user) {
-      throw new DomainError(400, 'INVALID_TOKEN', 'Invalid or expired password reset token.');
+    const normalized = normalizeEmail(email);
+    const cleanedCode = (codeOrToken || '').trim();
+    if (!cleanedCode) {
+      throw new DomainError(400, 'INVALID_TOKEN', 'Enter the verification code sent to your email.');
     }
+
+    const nowMs = this.referenceDateProvider().getTime();
+    const user = this.ds('workspace').users.find(
+      (u) => normalizeEmail(u.email) === normalized && u.active
+    );
+    if (!user || (!user.resetTokenHash && !user.resetToken)) {
+      throw new DomainError(400, 'INVALID_TOKEN', 'Invalid or expired password reset code.');
+    }
+    if (user.resetTokenExpiresAt && user.resetTokenExpiresAt < nowMs) {
+      user.resetTokenHash = undefined;
+      user.resetTokenExpiresAt = undefined;
+      user.resetToken = undefined;
+      throw new DomainError(400, 'TOKEN_EXPIRED', 'This reset code has expired. Please request a new one.');
+    }
+
+    const candidateHash = hashResetCode(cleanedCode);
+    const matchesHash = user.resetTokenHash
+      ? timingSafeHexEqual(user.resetTokenHash, candidateHash)
+      : false;
+    const matchesLegacy = user.resetToken ? timingSafeHexEqual(user.resetToken, cleanedCode) : false;
+
+    if (!matchesHash && !matchesLegacy) {
+      user.resetFailedAttempts = (user.resetFailedAttempts ?? 0) + 1;
+      if (user.resetFailedAttempts >= MAX_RESET_VERIFY_ATTEMPTS) {
+        user.resetTokenHash = undefined;
+        user.resetTokenExpiresAt = undefined;
+        user.resetToken = undefined;
+        user.resetFailedAttempts = 0;
+        throw new DomainError(
+          429,
+          'RESET_CODE_INVALIDATED',
+          'Too many invalid reset code attempts. This code has been invalidated; please request a new one.'
+        );
+      }
+      const left = MAX_RESET_VERIFY_ATTEMPTS - user.resetFailedAttempts;
+      throw new DomainError(
+        400,
+        'INVALID_TOKEN',
+        `Invalid password reset code. ${left} attempt${left === 1 ? '' : 's'} remaining.`
+      );
+    }
+
     const { hash, salt } = hashPassword(newPassword);
     user.passwordHash = hash;
     user.passwordSalt = salt;
+    user.passwordConfigured = true;
+    user.resetTokenHash = undefined;
+    user.resetTokenExpiresAt = undefined;
     user.resetToken = undefined;
+    user.resetFailedAttempts = 0;
+    this.clearLoginAttempts('workspace', user.email);
+
+    const actor = this.resolveActiveActor('workspace', user.id);
+    this.logAudit(
+      actor,
+      user.role === 'SUPER_ADMIN' ? 'SUPER_ADMIN_PASSWORD_RESET_VIA_EMAIL' : 'USER_PASSWORD_RESET_WITH_TOKEN',
+      'user',
+      user.id,
+      `Password updated securely for ${user.displayName} (${user.email})`
+    );
   }
 
   public inviteUser(
@@ -350,17 +678,12 @@ export class AgencyStore {
       canManageNetwork?: boolean;
       introducedByCoordinatorId?: string;
       initialPassword?: string;
+      showOnLogin?: boolean;
     }
   ): { userId: string; inviteToken?: string; passwordConfigured: boolean } {
     this.assertRole(actor, ['SUPER_ADMIN']);
     const data = this.ds(actor.namespace);
-    const email = input.email.trim().toLowerCase();
-    if (!email || !email.includes('@')) {
-      throw new DomainError(400, 'INVALID_EMAIL', 'Valid email address required.');
-    }
-    if (data.users.some((u) => u.email.toLowerCase() === email)) {
-      throw new DomainError(409, 'EMAIL_EXISTS', 'An account with this email already exists.');
-    }
+    const email = this.assertEmailUnique(actor.namespace, input.email);
 
     let passwordHash: string;
     let passwordSalt: string;
@@ -445,6 +768,8 @@ export class AgencyStore {
       active: true,
       invitedBy: actor.id,
       inviteToken,
+      passwordConfigured,
+      showOnLogin: Boolean(input.showOnLogin),
       createdAt: now,
     });
 
@@ -475,8 +800,13 @@ export class AgencyStore {
       const { hash, salt } = hashPassword(newPassword);
       user.passwordHash = hash;
       user.passwordSalt = salt;
+      user.passwordConfigured = true;
       user.resetToken = undefined;
+      user.resetTokenHash = undefined;
+      user.resetTokenExpiresAt = undefined;
+      user.resetFailedAttempts = 0;
       user.inviteToken = undefined;
+      this.clearLoginAttempts(actor.namespace, user.email);
       this.logAudit(
         actor,
         'ADMIN_PASSWORD_RESET',
@@ -487,14 +817,18 @@ export class AgencyStore {
       return { userId: user.id, email: user.email, passwordUpdated: true };
     }
 
-    const resetToken = crypto.randomBytes(12).toString('hex');
-    user.resetToken = resetToken;
+    const resetToken = crypto.randomBytes(6).toString('hex').toUpperCase();
+    user.resetTokenHash = hashResetCode(resetToken);
+    user.resetTokenExpiresAt = this.referenceDateProvider().getTime() + RESET_TOKEN_TTL_MS;
+    user.resetFailedAttempts = 0;
+    user.resetToken = undefined;
+    this.clearLoginAttempts(actor.namespace, user.email);
     this.logAudit(
       actor,
       'ADMIN_PASSWORD_RESET_TOKEN',
       'user',
       user.id,
-      `Super Admin generated a password reset token for ${user.displayName} (${user.role})`
+      `Super Admin generated a 15-minute password reset code for ${user.displayName} (${user.role})`
     );
     return { userId: user.id, email: user.email, resetToken, passwordUpdated: false };
   }
@@ -596,9 +930,10 @@ export class AgencyStore {
     if (!password || password.length < 8) {
       throw new DomainError(400, 'WEAK_PASSWORD', 'Password must be at least 8 characters.');
     }
-    const normalized = email.trim().toLowerCase();
+    const normalized = normalizeEmail(email);
+    const cleanedToken = (inviteToken || '').trim();
     const user = this.ds('workspace').users.find(
-      (u) => u.email.toLowerCase() === normalized && u.inviteToken === inviteToken
+      (u) => normalizeEmail(u.email) === normalized && u.inviteToken && u.inviteToken === cleanedToken
     );
     if (!user) {
       throw new DomainError(400, 'INVALID_INVITE', 'Invalid invitation email or token.');
@@ -606,8 +941,10 @@ export class AgencyStore {
     const { hash, salt } = hashPassword(password);
     user.passwordHash = hash;
     user.passwordSalt = salt;
+    user.passwordConfigured = true;
     user.inviteToken = undefined;
     user.active = true;
+    this.clearLoginAttempts('workspace', user.email);
     return this.resolveActiveActor('workspace', user.id);
   }
 
@@ -629,6 +966,173 @@ export class AgencyStore {
       if (s) s.active = active;
     }
     this.logAudit(actor, active ? 'USER_REACTIVATED' : 'USER_DEACTIVATED', 'user', targetUserId, `${active ? 'Activated' : 'Deactivated'} user ${user.displayName}`);
+  }
+
+  public setUserShowOnLogin(actor: SessionUser, targetUserId: string, showOnLogin: boolean): void {
+    this.assertRole(actor, ['SUPER_ADMIN']);
+    const data = this.ds(actor.namespace);
+    const user = data.users.find((u) => u.id === targetUserId);
+    if (!user) throw new DomainError(404, 'NOT_FOUND', 'User not found.');
+    user.showOnLogin = Boolean(showOnLogin);
+    this.logAudit(
+      actor,
+      showOnLogin ? 'LOGIN_QUICKFILL_ENABLED' : 'LOGIN_QUICKFILL_DISABLED',
+      'user',
+      targetUserId,
+      `${showOnLogin ? 'Enabled' : 'Hidden'} login quick-fill entry for ${user.displayName} (${user.email})`
+    );
+  }
+
+  public getLoginQuickFillAccounts(): Array<{ email: string; displayName: string; role: Role }> {
+    const data = this.ds('workspace');
+    return data.users
+      .filter((u) => u.active && Boolean(u.showOnLogin))
+      .map((u) => ({
+        email: u.email,
+        displayName: u.displayName,
+        role: u.role,
+      }));
+  }
+
+  public getMyProfile(actor: SessionUser) {
+    const data = this.ds(actor.namespace);
+    const user = data.users.find((u) => u.id === actor.id);
+    const coord = actor.coordinatorId ? data.coordinators.find((c) => c.id === actor.coordinatorId) : undefined;
+    const sub = actor.substituteId ? data.substitutes.find((s) => s.id === actor.substituteId) : undefined;
+    return {
+      displayName: user?.displayName ?? actor.displayName,
+      email: user?.email ?? actor.email,
+      role: actor.role,
+      canManageNetwork: actor.canManageNetwork,
+      callingPhone: coord?.callingPhone ?? sub?.phone ?? '',
+      whatsappPhone: coord?.whatsappPhone ?? sub?.whatsappPhone ?? '',
+      region: coord?.region ?? '',
+      defaultMemberFee: coord?.defaultMemberFee,
+      defaultSubstitutePayout: coord?.defaultSubstitutePayout,
+      homeArea: sub?.homeArea ?? '',
+      availability: sub?.availability,
+      emergencyConsent: sub?.emergencyConsent,
+      emergencyContactName: sub?.emergencyContactName ?? '',
+      emergencyContactPhone: sub?.emergencyContactPhone ?? '',
+      upiReference: sub?.upiReference ?? '',
+    };
+  }
+
+  public updateMyProfile(
+    actor: SessionUser,
+    input: {
+      displayName?: string;
+      callingPhone?: string;
+      whatsappPhone?: string;
+      region?: string;
+      defaultMemberFee?: number;
+      defaultSubstitutePayout?: number;
+      homeArea?: string;
+      availability?: 'AVAILABLE' | 'LIMITED' | 'UNAVAILABLE';
+      emergencyConsent?: boolean;
+      emergencyContactName?: string;
+      emergencyContactPhone?: string;
+      upiReference?: string;
+    }
+  ) {
+    const data = this.ds(actor.namespace);
+    const user = data.users.find((u) => u.id === actor.id);
+    if (!user) throw new DomainError(404, 'NOT_FOUND', 'User account not found.');
+
+    if (input.displayName !== undefined) {
+      const trimmed = String(input.displayName).trim();
+      if (trimmed.length < 2) {
+        throw new DomainError(400, 'VALIDATION_ERROR', 'Display name must be at least 2 characters.');
+      }
+      user.displayName = trimmed;
+    }
+
+    if (actor.coordinatorId) {
+      const coord = data.coordinators.find((c) => c.id === actor.coordinatorId);
+      if (coord) {
+        if (input.displayName !== undefined) coord.name = user.displayName;
+        if (input.callingPhone !== undefined) coord.callingPhone = String(input.callingPhone).trim();
+        if (input.whatsappPhone !== undefined) coord.whatsappPhone = String(input.whatsappPhone).trim();
+        if (input.region !== undefined) coord.region = String(input.region).trim();
+        if (input.defaultMemberFee !== undefined) {
+          const fee = Number(input.defaultMemberFee);
+          if (!Number.isFinite(fee) || fee < 0) {
+            throw new DomainError(400, 'VALIDATION_ERROR', 'Default member fee must be zero or a positive amount.');
+          }
+          coord.defaultMemberFee = Math.round(fee);
+        }
+        if (input.defaultSubstitutePayout !== undefined) {
+          const payout = Number(input.defaultSubstitutePayout);
+          if (!Number.isFinite(payout) || payout < 0) {
+            throw new DomainError(400, 'VALIDATION_ERROR', 'Default substitute payout must be zero or a positive amount.');
+          }
+          coord.defaultSubstitutePayout = Math.round(payout);
+        }
+      }
+    }
+
+    if (actor.substituteId) {
+      const sub = data.substitutes.find((s) => s.id === actor.substituteId);
+      if (sub) {
+        if (input.displayName !== undefined) sub.name = user.displayName;
+        if (input.callingPhone !== undefined) sub.phone = String(input.callingPhone).trim();
+        if (input.whatsappPhone !== undefined) sub.whatsappPhone = String(input.whatsappPhone).trim();
+        if (input.homeArea !== undefined) sub.homeArea = String(input.homeArea).trim();
+        if (input.availability !== undefined) {
+          if (!['AVAILABLE', 'LIMITED', 'UNAVAILABLE'].includes(input.availability)) {
+            throw new DomainError(400, 'VALIDATION_ERROR', 'Invalid availability status.');
+          }
+          sub.availability = input.availability;
+        }
+        if (input.emergencyConsent !== undefined) {
+          sub.emergencyConsent = Boolean(input.emergencyConsent);
+        }
+        if (input.emergencyContactName !== undefined) {
+          sub.emergencyContactName = String(input.emergencyContactName).trim() || undefined;
+        }
+        if (input.emergencyContactPhone !== undefined) {
+          sub.emergencyContactPhone = String(input.emergencyContactPhone).trim() || undefined;
+        }
+        if (input.upiReference !== undefined) {
+          sub.upiReference = String(input.upiReference).trim() || undefined;
+        }
+      }
+    }
+
+    const updatedActor = this.resolveActiveActor(actor.namespace, user.id);
+    this.logAudit(updatedActor, 'PROFILE_UPDATED', 'user', user.id, `Updated account profile & preferences for ${user.displayName}`);
+    return {
+      user: updatedActor,
+      profile: this.getMyProfile(updatedActor),
+    };
+  }
+
+  public changeOwnPassword(actor: SessionUser, currentPassword: string, newPassword: string): void {
+    const data = this.ds(actor.namespace);
+    const user = data.users.find((u) => u.id === actor.id);
+    if (!user) throw new DomainError(404, 'NOT_FOUND', 'User account not found.');
+    if (!currentPassword) {
+      throw new DomainError(400, 'CURRENT_PASSWORD_REQUIRED', 'Enter your current password to continue.');
+    }
+    if (!newPassword || newPassword.length < 8) {
+      throw new DomainError(400, 'WEAK_PASSWORD', 'New password must be at least 8 characters.');
+    }
+    if (!user.passwordHash || !user.passwordSalt || !verifyPassword(currentPassword, user.passwordHash, user.passwordSalt)) {
+      throw new DomainError(401, 'INVALID_CURRENT_PASSWORD', 'Current password is incorrect.');
+    }
+    if (currentPassword === newPassword) {
+      throw new DomainError(400, 'SAME_PASSWORD', 'New password must be different from your current password.');
+    }
+    const { hash, salt } = hashPassword(newPassword);
+    user.passwordHash = hash;
+    user.passwordSalt = salt;
+    user.passwordConfigured = true;
+    user.resetToken = undefined;
+    user.resetTokenHash = undefined;
+    user.resetTokenExpiresAt = undefined;
+    user.resetFailedAttempts = 0;
+    this.clearLoginAttempts(actor.namespace, user.email);
+    this.logAudit(actor, 'PASSWORD_CHANGED', 'user', user.id, `Updated account password for ${user.displayName}`);
   }
 
   // ==================== SCOPED READ SNAPSHOT ====================
@@ -655,6 +1159,16 @@ export class AgencyStore {
           ).length;
           const myResp = myResponses.find((r) => r.requestId === req.id);
           const myAsgn = myAssignments.find((a) => a.requestId === req.id && a.status !== 'REPLACED');
+          const sameDateOtherSelf = myAssignments.find(
+            (a) =>
+              a.requestId !== req.id &&
+              a.meetingDate === req.meetingDate &&
+              !a.isDelegated &&
+              !['CANCELLED', 'REPLACED', 'NO_SHOW'].includes(a.status)
+          );
+          const conflictReq = sameDateOtherSelf
+            ? data.requests.find((r) => r.id === sameDateOtherSelf.requestId)
+            : undefined;
           return {
             id: req.id,
             requestNumber: req.requestNumber,
@@ -681,14 +1195,22 @@ export class AgencyStore {
             coordinatorWhatsappPhone: coord?.whatsappPhone ?? '',
             myResponse: myResp,
             myAssignmentId: myAsgn?.id,
+            sameDateSelfConflict: sameDateOtherSelf
+              ? {
+                  assignmentId: sameDateOtherSelf.id,
+                  chapterName: conflictReq?.chapterNameSnapshot ?? 'Another Meeting',
+                  reportingTime: conflictReq?.reportingTime ?? '',
+                }
+              : undefined,
           };
         });
 
-      // Confirmed meetings include full private member briefing ONLY for confirmed assignments
+      // Confirmed meetings share instructions, venue & coordinator contact ONLY (NEVER member personal/business/contact details)
+      const superAdminCoord = data.coordinators.find((c) => c.isSuperAdmin);
       const confirmedBriefings = myAssignments.map((asgn) => {
         const req = data.requests.find((r) => r.id === asgn.requestId);
-        const coord = data.coordinators.find((c) => c.id === asgn.coordinatorId);
-        const viaCoord = data.coordinators.find((c) => c.id === (asgn.assignedViaCoordinatorId || asgn.coordinatorId));
+        const coord = data.coordinators.find((c) => c.id === asgn.coordinatorId) ?? superAdminCoord;
+        const viaCoord = data.coordinators.find((c) => c.id === (asgn.assignedViaCoordinatorId || asgn.coordinatorId)) ?? coord;
         return {
           assignment: asgn,
           requestNumber: req?.requestNumber ?? 0,
@@ -702,19 +1224,25 @@ export class AgencyStore {
           reportingTime: req?.reportingTime ?? '',
           startTime: req?.startTime ?? '',
           endTime: req?.endTime ?? '',
-          memberName: req?.memberNameSnapshot ?? '',
-          memberBusiness: req?.memberBusinessSnapshot ?? '',
           intro30Sec: req?.intro30SecSnapshot ?? '',
+          memberNoteType: req?.referralAskSnapshot ? (req?.memberNoteType ?? 'GENERAL_NOTE') : undefined,
+          referralAsk: req?.referralAskSnapshot || undefined,
           specialInstructions: req?.specialInstructions ?? '',
           coordinatorName: coord?.name ?? 'Agency Coordinator',
           assignedViaCoordinatorId: viaCoord?.id ?? asgn.assignedViaCoordinatorId,
           assignedViaCoordinatorName: viaCoord?.name ?? coord?.name ?? 'Agency Coordinator',
-          coordinatorCallingPhone: coord?.callingPhone ?? '',
-          coordinatorWhatsappPhone: coord?.whatsappPhone ?? '',
+          coordinatorCallingPhone: coord?.callingPhone || superAdminCoord?.callingPhone || '',
+          coordinatorWhatsappPhone: coord?.whatsappPhone || coord?.callingPhone || superAdminCoord?.whatsappPhone || '',
         };
       });
 
-      const myEarnings = data.substituteEarnings.filter((e) => e.payeeSubstituteId === actor.substituteId);
+      const myEarnings = data.substituteEarnings
+        .filter((e) => e.payeeSubstituteId === actor.substituteId)
+        .map((e) => ({
+          ...e,
+          memberId: '',
+          memberName: '',
+        }));
       const myPayouts = data.freelancerPayouts.filter((p) => p.payeeSubstituteId === actor.substituteId);
       const myBonuses = data.appreciationBonuses.filter((b) => b.payeeSubstituteId === actor.substituteId);
       const myGuestContacts = actor.canManageNetwork
@@ -774,6 +1302,7 @@ export class AgencyStore {
 
       return {
         actor,
+        myProfile: this.getMyProfile(actor),
         today: getTomorrowInKolkata(new Date(this.referenceDateProvider().getTime() - 86400000)),
         tomorrow: getTomorrowInKolkata(this.referenceDateProvider()),
         substituteProfile: meSub,
@@ -843,6 +1372,7 @@ export class AgencyStore {
           canManageNetwork: Boolean(u.canManageNetwork),
           active: u.active,
           hasPendingInvite: Boolean(u.inviteToken),
+          showOnLogin: Boolean(u.showOnLogin),
           createdAt: u.createdAt,
         }))
       : [];
@@ -856,6 +1386,7 @@ export class AgencyStore {
 
     return {
       actor,
+      myProfile: this.getMyProfile(actor),
       today: getTomorrowInKolkata(new Date(this.referenceDateProvider().getTime() - 86400000)),
       tomorrow: getTomorrowInKolkata(this.referenceDateProvider()),
       coordinators: isAdmin
@@ -1080,6 +1611,7 @@ export class AgencyStore {
       email?: string;
       sendInvite?: boolean;
       initialPassword?: string;
+      showOnLogin?: boolean;
     }
   ): { substitute: Substitute; inviteToken?: string; passwordConfigured?: boolean } {
     this.assertRole(actor, ['SUPER_ADMIN']);
@@ -1091,9 +1623,14 @@ export class AgencyStore {
     if (input.id) {
       const existing = data.substitutes.find((s) => s.id === input.id);
       if (!existing) throw new DomainError(404, 'NOT_FOUND', 'Substitute not found.');
+      const nextEmail =
+        input.email !== undefined && input.email.trim().length > 0
+          ? this.assertEmailUnique(actor.namespace, input.email, existing.userId)
+          : existing.email;
       const prevNetwork = existing.canManageNetwork;
       Object.assign(existing, {
         name: input.name.trim(),
+        email: nextEmail,
         phone: input.phone.trim(),
         whatsappPhone: (input.whatsappPhone || input.phone).trim(),
         homeArea: input.homeArea?.trim() ?? existing.homeArea,
@@ -1117,8 +1654,12 @@ export class AgencyStore {
       const usr = data.users.find((u) => u.id === existing.userId);
       if (usr) {
         usr.displayName = existing.name;
+        usr.email = nextEmail;
         usr.canManageNetwork = existing.canManageNetwork;
         usr.active = existing.active;
+        if (input.showOnLogin !== undefined) {
+          usr.showOnLogin = Boolean(input.showOnLogin);
+        }
       }
       if (prevNetwork !== existing.canManageNetwork) {
         this.logAudit(
@@ -1134,7 +1675,10 @@ export class AgencyStore {
       return { substitute: existing };
     }
 
-    const email = (input.email?.trim() || `${input.name.toLowerCase().replace(/[^a-z0-9]/g, '.')}@invite.agencyos.local`).toLowerCase();
+    if (!input.email || !input.email.trim()) {
+      throw new DomainError(400, 'INVALID_EMAIL', 'A unique login email address is required for each substitute account.');
+    }
+    const email = this.assertEmailUnique(actor.namespace, input.email);
     const { userId, inviteToken, passwordConfigured } = this.inviteUser(actor, {
       email,
       displayName: input.name.trim(),
@@ -1146,6 +1690,7 @@ export class AgencyStore {
       canManageNetwork: Boolean(input.canManageNetwork),
       introducedByCoordinatorId: input.introducedByCoordinatorId || undefined,
       initialPassword: input.initialPassword,
+      showOnLogin: Boolean(input.showOnLogin),
     });
 
     const created = data.substitutes.find((s) => s.userId === userId)!;
@@ -1256,6 +1801,8 @@ export class AgencyStore {
       startTime?: string;
       endTime?: string;
       intro30Sec?: string;
+      memberNoteType?: MemberNoteType;
+      referralAsk?: string;
       assignmentMode: AssignmentMode;
       requireManagerApproval?: boolean;
       allowBids?: boolean;
@@ -1345,6 +1892,8 @@ export class AgencyStore {
       startTime: input.startTime?.trim() || chosenChapter.startTime,
       endTime: input.endTime?.trim() || chosenChapter.endTime,
       intro30SecSnapshot: input.intro30Sec?.trim() || member.intro30Sec,
+      memberNoteType: input.referralAsk?.trim() ? (input.memberNoteType ?? 'GENERAL_NOTE') : undefined,
+      referralAskSnapshot: input.referralAsk?.trim() || undefined,
       memberNameSnapshot: member.name,
       memberBusinessSnapshot: member.businessName,
       memberPhoneSnapshot: member.phone,
@@ -1462,6 +2011,64 @@ export class AgencyStore {
     return req;
   }
 
+  public updateRequestReferralAsk(
+    actor: SessionUser,
+    requestId: string,
+    referralAsk: string,
+    memberNoteType?: MemberNoteType
+  ): MeetingRequest {
+    this.assertRole(actor, ['SUPER_ADMIN', 'EXTERNAL_COORDINATOR']);
+    const data = this.ds(actor.namespace);
+    const req = data.requests.find((r) => r.id === requestId);
+    if (!req) throw new DomainError(404, 'NOT_FOUND', 'Request not found.');
+    if (!this.canAccessCoordinatorScope(actor, req.coordinatorId)) {
+      throw new DomainError(403, 'FORBIDDEN', 'Access denied.');
+    }
+    const cleaned = (referralAsk || '').trim();
+    const resolvedType: MemberNoteType | undefined = cleaned
+      ? (memberNoteType ?? req.memberNoteType ?? 'GENERAL_NOTE')
+      : undefined;
+    req.referralAskSnapshot = cleaned || undefined;
+    req.memberNoteType = resolvedType;
+    req.updatedAt = this.now();
+
+    const typeLabel = getMemberNoteTypeLabel(resolvedType);
+
+    // Notify any active confirmed substitutes so they see the updated note immediately
+    if (cleaned) {
+      const activeAsgns = data.assignments.filter(
+        (a) => a.requestId === req.id && a.status !== 'CANCELLED' && a.status !== 'REPLACED'
+      );
+      const notifiedUsers = new Set<string>();
+      for (const asgn of activeAsgns) {
+        const sub = data.substitutes.find((s) => s.id === asgn.contractSubstituteId);
+        if (sub && !notifiedUsers.has(sub.userId)) {
+          notifiedUsers.add(sub.userId);
+          this.pushNotification(
+            actor.namespace,
+            sub.userId,
+            `${typeLabel} Updated · ${req.chapterNameSnapshot}`,
+            `New ${typeLabel.toLowerCase()} for ${formatShortDate(req.meetingDate)}: "${cleaned.slice(0, 90)}${cleaned.length > 90 ? '…' : ''}"`,
+            'ASSIGNMENT',
+            asgn.id
+          );
+        }
+      }
+    }
+
+    this.logAudit(
+      actor,
+      'REQUEST_REFERRAL_ASK_UPDATED',
+      'request',
+      req.id,
+      cleaned
+        ? `Attached ${typeLabel} on #${req.requestNumber} (${req.chapterNameSnapshot})`
+        : `Cleared member note on #${req.requestNumber} (${req.chapterNameSnapshot})`,
+      req.coordinatorId
+    );
+    return req;
+  }
+
   // ==================== SUBSTITUTE RESPONSES, ATOMIC FIRST-CONFIRM & DELEGATION ====================
 
   public submitResponse(
@@ -1472,13 +2079,19 @@ export class AgencyStore {
       proposedPayout?: number;
       delegatedGuestId?: string;
       note?: string;
+      requestCrossMeeting?: boolean;
     }
-  ): { response: RequestResponse; assignment?: Assignment; autoConfirmed: boolean } {
+  ): {
+    response: RequestResponse;
+    assignment?: Assignment;
+    autoConfirmed: boolean;
+    crossMeetingPending?: boolean;
+  } {
     this.assertRole(actor, ['SUBSTITUTE']);
     const data = this.ds(actor.namespace);
     const subId = actor.substituteId!;
     const sub = data.substitutes.find((s) => s.id === subId && s.active);
-    if (!sub) throw new DomainError(403, 'INACTIVE_SUBSTITUTE', 'Your substitute profile is not active.');
+    if (!sub) throw new DomainError(403, 'INACTIVE_SUBSTITUTE', 'Your Veloctive Team profile is not active.');
 
     const req = data.requests.find((r) => r.id === requestId);
     if (!req) throw new DomainError(404, 'NOT_FOUND', 'Request not found.');
@@ -1501,14 +2114,24 @@ export class AgencyStore {
         throw new DomainError(409, 'ALREADY_FILLED', 'All positions for this request are already filled.');
       }
 
-      // Check cross-coordinator time conflict for same self-attending substitute OR same physical guest on same meetingDate + reportingTime
-      const hasSelfConflict = data.assignments.some((a) => {
-        if (a.contractSubstituteId !== subId || a.meetingDate !== req.meetingDate) return false;
-        if (['CANCELLED', 'REPLACED', 'NO_SHOW'].includes(a.status)) return false;
-        if (input.responseType === 'DELEGATE_PROPOSAL' || a.isDelegated) return false;
-        const otherReq = data.requests.find((r) => r.id === a.requestId);
-        return otherReq?.reportingTime === req.reportingTime;
-      });
+      // Same-date self-attendance lock across ALL coordinators & Super Admin:
+      // If the Veloctive Team member already holds a self-attended meeting on req.meetingDate,
+      // they CANNOT auto-accept another request on their own name; they may only submit a
+      // Cross-Meeting Request pinned to Super Admin for explicit approval.
+      const sameDateSelfAssignment =
+        input.responseType === 'DELEGATE_PROPOSAL' || input.responseType === 'NOT_AVAILABLE'
+          ? undefined
+          : data.assignments.find(
+              (a) =>
+                a.contractSubstituteId === subId &&
+                a.meetingDate === req.meetingDate &&
+                !a.isDelegated &&
+                !['CANCELLED', 'REPLACED', 'NO_SHOW'].includes(a.status)
+            );
+      const sameDateConflictReq = sameDateSelfAssignment
+        ? data.requests.find((r) => r.id === sameDateSelfAssignment.requestId)
+        : undefined;
+      const isCrossMeetingRequest = Boolean(sameDateSelfAssignment);
 
       // Validate partner guest delegation (AT-06, AT-08)
       let guest: PartnerGuestContact | undefined;
@@ -1540,11 +2163,11 @@ export class AgencyStore {
         }
       }
 
-      if (input.responseType === 'FIRST_CONFIRM' && hasSelfConflict) {
+      if (input.responseType === 'FIRST_CONFIRM' && isCrossMeetingRequest && !input.requestCrossMeeting) {
         throw new DomainError(
           409,
           'TIME_CONFLICT',
-          'Time slot conflict with another confirmed assignment at this date and reporting time.'
+          'You already have a meeting on this date. Submit a Cross-Meeting Request so Super Admin can review and allow it.'
         );
       }
 
@@ -1564,7 +2187,7 @@ export class AgencyStore {
         input.responseType === 'BID' ||
         input.responseType === 'DELEGATE_PROPOSAL' ||
         req.requireManagerApproval ||
-        hasSelfConflict;
+        isCrossMeetingRequest;
 
       const canAutoConfirm =
         req.assignmentMode === 'FIRST_CONFIRM' &&
@@ -1586,6 +2209,10 @@ export class AgencyStore {
         response.delegatedGuestId = guest?.id;
         response.delegatedGuestName = guest?.name;
         response.note = input.note?.trim();
+        response.isCrossMeetingRequest = isCrossMeetingRequest || undefined;
+        response.crossMeetingConflictAssignmentId = sameDateSelfAssignment?.id;
+        response.crossMeetingConflictChapter = sameDateConflictReq?.chapterNameSnapshot;
+        response.crossMeetingConflictTime = sameDateConflictReq?.reportingTime;
         response.status = nextRespStatus;
         response.updatedAt = now;
       } else {
@@ -1599,6 +2226,10 @@ export class AgencyStore {
           delegatedGuestId: guest?.id,
           delegatedGuestName: guest?.name,
           note: input.note?.trim(),
+          isCrossMeetingRequest: isCrossMeetingRequest || undefined,
+          crossMeetingConflictAssignmentId: sameDateSelfAssignment?.id,
+          crossMeetingConflictChapter: sameDateConflictReq?.chapterNameSnapshot,
+          crossMeetingConflictTime: sameDateConflictReq?.reportingTime,
           status: nextRespStatus,
           createdAt: now,
           updatedAt: now,
@@ -1606,7 +2237,7 @@ export class AgencyStore {
         data.responses.unshift(response);
       }
 
-      // Notify coordinator
+      // Notify coordinator & (for cross-meeting requests) pin directly to Super Admin
       const coord = data.coordinators.find((c) => c.id === req.coordinatorId);
 
       if (canAutoConfirm) {
@@ -1682,7 +2313,31 @@ export class AgencyStore {
         req.updatedAt = now;
       }
 
-      if (coord && input.responseType !== 'NOT_AVAILABLE') {
+      if (isCrossMeetingRequest && input.responseType !== 'NOT_AVAILABLE') {
+        const superAdmins = data.users.filter((u) => u.role === 'SUPER_ADMIN' && u.active);
+        const notifiedIds = new Set<string>();
+        for (const sa of superAdmins) {
+          notifiedIds.add(sa.id);
+          this.pushNotification(
+            actor.namespace,
+            sa.id,
+            `Pinned Cross-Meeting Request — ${sub.name}`,
+            `${sub.name} is already assigned to ${sameDateConflictReq?.chapterNameSnapshot ?? 'another meeting'} on ${req.meetingDate} (${sameDateConflictReq?.reportingTime ?? ''}) and requested #${req.requestNumber} (${req.chapterNameSnapshot}). Super Admin approval required.`,
+            'REQUEST',
+            req.id
+          );
+        }
+        if (coord && !notifiedIds.has(coord.userId)) {
+          this.pushNotification(
+            actor.namespace,
+            coord.userId,
+            `Cross-Meeting Request Pending Super Admin — #${req.requestNumber}`,
+            `${sub.name} already has a meeting on ${req.meetingDate}. Pinned to Super Admin for Cross-Meeting approval.`,
+            'REQUEST',
+            req.id
+          );
+        }
+      } else if (coord && input.responseType !== 'NOT_AVAILABLE') {
         const label =
           input.responseType === 'DELEGATE_PROPOSAL'
             ? `nominated guest ${guest?.name} (approval required)`
@@ -1701,14 +2356,16 @@ export class AgencyStore {
 
       this.logAudit(
         actor,
-        'RESPONSE_SUBMITTED',
+        isCrossMeetingRequest ? 'CROSS_MEETING_REQUESTED' : 'RESPONSE_SUBMITTED',
         'request_response',
         response.id,
-        `${sub.name} submitted ${input.responseType} on #${req.requestNumber}`,
+        isCrossMeetingRequest
+          ? `${sub.name} submitted pinned Cross-Meeting request on #${req.requestNumber} (same-date conflict with ${sameDateConflictReq?.chapterNameSnapshot ?? 'existing booking'})`
+          : `${sub.name} submitted ${input.responseType} on #${req.requestNumber}`,
         req.coordinatorId
       );
 
-      return { response, autoConfirmed: false };
+      return { response, autoConfirmed: false, crossMeetingPending: isCrossMeetingRequest };
     } finally {
       this.activeLocks.delete(lockKey);
     }
@@ -1757,21 +2414,41 @@ export class AgencyStore {
       throw new DomainError(400, 'GUEST_MISSING', 'Nominated guest contact is no longer available.');
     }
 
-    // Cross-coordinator slot conflict prevention without leaking other coordinator's private data
-    const hasConflict = data.assignments.some((a) => {
-      if (a.meetingDate !== req.meetingDate || ['CANCELLED', 'REPLACED', 'NO_SHOW'].includes(a.status)) return false;
-      const otherReq = data.requests.find((r) => r.id === a.requestId);
-      if (otherReq?.reportingTime !== req.reportingTime) return false;
-      if (isDelegated) {
-        return a.isDelegated && a.actualAttendeeGuestId === guest?.id;
+    // Same-date Cross-Meeting protection:
+    // - Delegated guests still cannot double-book the exact same date & reportingTime.
+    // - Self-attending Veloctive Team members who already hold a meeting on the same date
+    //   CANNOT be approved by External Coordinators; ONLY Super Admin may allow a Cross-Meeting!
+    if (isDelegated) {
+      const guestConflict = data.assignments.some((a) => {
+        if (a.meetingDate !== req.meetingDate || ['CANCELLED', 'REPLACED', 'NO_SHOW'].includes(a.status)) return false;
+        const otherReq = data.requests.find((r) => r.id === a.requestId);
+        return otherReq?.reportingTime === req.reportingTime && a.isDelegated && a.actualAttendeeGuestId === guest?.id;
+      });
+      if (guestConflict) {
+        throw new DomainError(
+          409,
+          'TIME_CONFLICT',
+          'Nominated guest already has a confirmed assignment at this date and reporting time.'
+        );
       }
-      return !a.isDelegated && a.contractSubstituteId === sub.id;
-    });
-    if (hasConflict) {
+    }
+
+    const sameDateSelfConflict = !isDelegated
+      ? data.assignments.find(
+          (a) =>
+            a.meetingDate === req.meetingDate &&
+            !a.isDelegated &&
+            a.contractSubstituteId === sub.id &&
+            !['CANCELLED', 'REPLACED', 'NO_SHOW'].includes(a.status)
+        )
+      : undefined;
+
+    const isCrossMeetingApproval = Boolean(sameDateSelfConflict || resp.isCrossMeetingRequest);
+    if (isCrossMeetingApproval && actor.role !== 'SUPER_ADMIN') {
       throw new DomainError(
-        409,
-        'TIME_CONFLICT',
-        'Time slot conflict with another confirmed assignment at this date and reporting time.'
+        403,
+        'CROSS_MEETING_SUPER_ADMIN_ONLY',
+        'This Veloctive Team member already has a meeting on this date. Only Super Admin can approve a Cross-Meeting exception.'
       );
     }
 
@@ -1818,6 +2495,8 @@ export class AgencyStore {
       checkinState: 'AWAITING_REPLY',
       lastCheckinReportedByPartner: false,
       finishedReportedByPartner: false,
+      isCrossMeeting: isCrossMeetingApproval || undefined,
+      crossMeetingApprovedByUserId: isCrossMeetingApproval ? actor.id : undefined,
       disputed: false,
       createdAt: now,
       updatedAt: now,
@@ -1844,18 +2523,30 @@ export class AgencyStore {
     this.pushNotification(
       actor.namespace,
       sub.userId,
-      isDelegated ? `Guest Delegate Approved — ${guest!.name}` : `Assignment Confirmed — ${req.chapterNameSnapshot}`,
-      `Confirmed for ${req.meetingDate} (${req.reportingTime}). Agreed payout: ₹${agreedPayout}. Member briefing is now unlocked.`,
+      isCrossMeetingApproval
+        ? `Cross-Meeting Approved — ${req.chapterNameSnapshot}`
+        : isDelegated
+        ? `Guest Delegate Approved — ${guest!.name}`
+        : `Assignment Confirmed — ${req.chapterNameSnapshot}`,
+      isCrossMeetingApproval
+        ? `Super Admin approved your Cross-Meeting for ${req.meetingDate} (${req.reportingTime}). Agreed payout: ₹${agreedPayout}.`
+        : `Confirmed for ${req.meetingDate} (${req.reportingTime}). Agreed payout: ₹${agreedPayout}. Member briefing is now unlocked.`,
       'ASSIGNMENT',
       assignment.id
     );
 
     this.logAudit(
       actor,
-      isDelegated ? 'DELEGATE_APPROVED' : 'CANDIDATE_SELECTED',
+      isCrossMeetingApproval
+        ? 'CROSS_MEETING_APPROVED'
+        : isDelegated
+        ? 'DELEGATE_APPROVED'
+        : 'CANDIDATE_SELECTED',
       'assignment',
       assignment.id,
-      `Confirmed ${assignment.actualAttendeeName} (Payee: ${sub.name}) on #${req.requestNumber} for ₹${agreedPayout}`,
+      isCrossMeetingApproval
+        ? `Super Admin approved Cross-Meeting for ${assignment.actualAttendeeName} on #${req.requestNumber} (${req.meetingDate}) for ₹${agreedPayout}`
+        : `Confirmed ${assignment.actualAttendeeName} (Payee: ${sub.name}) on #${req.requestNumber} for ₹${agreedPayout}`,
       req.coordinatorId
     );
 
@@ -2084,21 +2775,35 @@ export class AgencyStore {
     });
 
     const coord = data.coordinators.find((c) => c.id === asgn.coordinatorId);
+    const viaCoord = data.coordinators.find((c) => c.id === asgn.assignedViaCoordinatorId);
     const partnerSub = data.substitutes.find((s) => s.id === asgn.contractSubstituteId);
     const attributionPhrase = reportedByPartner
       ? `Reported by Partner ${partnerSub?.name ?? actor.displayName} for Guest ${asgn.actualAttendeeName}`
       : `Self-reported by ${asgn.actualAttendeeName}`;
 
-    if (coord && actor.role === 'SUBSTITUTE') {
-      const labelMap = { AWAKE: 'is Awake', LEFT_HOME: 'has Left Home', REACHED: 'has Reached Venue' };
-      this.pushNotification(
-        actor.namespace,
-        coord.userId,
-        `Check-in: ${asgn.actualAttendeeName} ${labelMap[eventType]}`,
-        `${attributionPhrase} · ${req?.chapterNameSnapshot ?? ''}`,
-        'CHECKIN',
-        asgn.id
-      );
+    if (actor.role === 'SUBSTITUTE') {
+      const labelMap = { AWAKE: 'is Awake', LEFT_HOME: 'has Departed', REACHED: 'has Reached Venue' };
+      const recipientUserIds = new Set<string>();
+      if (coord?.userId) recipientUserIds.add(coord.userId);
+      if (viaCoord?.userId) recipientUserIds.add(viaCoord.userId);
+      if (asgn.confirmedByUserId && asgn.confirmedByUserId !== actor.id) {
+        const confirmer = data.users.find((u) => u.id === asgn.confirmedByUserId && u.active);
+        if (confirmer && confirmer.role !== 'SUBSTITUTE') recipientUserIds.add(confirmer.id);
+      }
+      for (const sa of data.users.filter((u) => u.role === 'SUPER_ADMIN' && u.active)) {
+        recipientUserIds.add(sa.id);
+      }
+
+      for (const recipientId of recipientUserIds) {
+        this.pushNotification(
+          actor.namespace,
+          recipientId,
+          `Check-in: ${asgn.actualAttendeeName} ${labelMap[eventType]}`,
+          `${attributionPhrase} · ${req?.chapterNameSnapshot ?? ''} (${req?.memberNameSnapshot ?? ''})`,
+          'CHECKIN',
+          asgn.id
+        );
+      }
     }
 
     this.logAudit(
@@ -2107,6 +2812,70 @@ export class AgencyStore {
       'assignment',
       asgn.id,
       `${asgn.actualAttendeeName} marked ${eventType} (${attributionPhrase})`,
+      asgn.coordinatorId
+    );
+    return asgn;
+  }
+
+  public reportAssignmentIssue(
+    actor: SessionUser,
+    assignmentId: string,
+    issueNote: string
+  ): Assignment {
+    const data = this.ds(actor.namespace);
+    const asgn = data.assignments.find((a) => a.id === assignmentId);
+    if (!asgn) throw new DomainError(404, 'NOT_FOUND', 'Assignment not found.');
+
+    if (actor.role === 'SUBSTITUTE') {
+      if (asgn.contractSubstituteId !== actor.substituteId) {
+        throw new DomainError(403, 'FORBIDDEN', 'You can only report issues on your own assignments.');
+      }
+    } else if (!this.canAccessCoordinatorScope(actor, asgn.coordinatorId)) {
+      throw new DomainError(403, 'FORBIDDEN', 'Access denied.');
+    }
+
+    if (['COMPLETED_SELF_REPORTED', 'VERIFIED', 'CANCELLED'].includes(asgn.status)) {
+      throw new DomainError(409, 'INVALID_STATE', 'Assignment is already finished or cancelled.');
+    }
+
+    const cleanNote = (issueNote || '').trim();
+    if (!cleanNote) {
+      throw new DomainError(400, 'ISSUE_NOTE_REQUIRED', 'Describe the issue before submitting.');
+    }
+
+    const now = this.now();
+    asgn.issueNote = cleanNote;
+    asgn.issueReportedAt = now;
+    asgn.updatedAt = now;
+
+    const req = data.requests.find((r) => r.id === asgn.requestId);
+    const coord = data.coordinators.find((c) => c.id === asgn.coordinatorId);
+    const viaCoord = data.coordinators.find((c) => c.id === asgn.assignedViaCoordinatorId);
+    if (actor.role === 'SUBSTITUTE') {
+      const recipientUserIds = new Set<string>();
+      if (coord?.userId) recipientUserIds.add(coord.userId);
+      if (viaCoord?.userId) recipientUserIds.add(viaCoord.userId);
+      for (const sa of data.users.filter((u) => u.role === 'SUPER_ADMIN' && u.active)) {
+        recipientUserIds.add(sa.id);
+      }
+      for (const recipientId of recipientUserIds) {
+        this.pushNotification(
+          actor.namespace,
+          recipientId,
+          `Issue Alert: ${asgn.actualAttendeeName} (${req?.chapterNameSnapshot ?? 'Meeting'})`,
+          cleanNote,
+          'ISSUE',
+          asgn.id
+        );
+      }
+    }
+
+    this.logAudit(
+      actor,
+      'ASSIGNMENT_ISSUE_REPORTED',
+      'assignment',
+      asgn.id,
+      `${asgn.actualAttendeeName} flagged an issue: ${cleanNote}`,
       asgn.coordinatorId
     );
     return asgn;

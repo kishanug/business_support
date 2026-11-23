@@ -13,6 +13,7 @@ import type {
   Location,
   MeetingRequest,
   Member,
+  MemberNoteType,
   MessageDeliveryState,
   MessageLog,
   MilestoneReward,
@@ -41,10 +42,12 @@ export function getAuthToken(): string | null {
 export class ApiError extends Error {
   status: number;
   code: string;
-  constructor(status: number, code: string, message: string) {
+  retryAfterSeconds?: number;
+  constructor(status: number, code: string, message: string, retryAfterSeconds?: number) {
     super(message);
     this.status = status;
     this.code = code;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -59,13 +62,20 @@ async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T
   const res = await fetch(url, { ...options, headers });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new ApiError(res.status, data.code || 'REQUEST_FAILED', data.error || 'Request failed');
+    throw new ApiError(
+      res.status,
+      data.code || 'REQUEST_FAILED',
+      data.error || 'Request failed',
+      typeof data.retryAfterSeconds === 'number' ? data.retryAfterSeconds : undefined
+    );
   }
   return data as T;
 }
 
 export interface AuthStatusResponse {
   workspaceInitialized: boolean;
+  superAdminPasswordConfigured: boolean;
+  smtpConfigured: boolean;
   supabaseConnected: boolean;
   environmentMode: string;
 }
@@ -80,7 +90,14 @@ export interface ManagedUserSummary {
   canManageNetwork: boolean;
   active: boolean;
   hasPendingInvite: boolean;
+  showOnLogin: boolean;
   createdAt: string;
+}
+
+export interface LoginQuickFillAccount {
+  email: string;
+  displayName: string;
+  role: Role;
 }
 
 export interface CoordinatorDirectoryItem {
@@ -89,8 +106,27 @@ export interface CoordinatorDirectoryItem {
   isSuperAdmin: boolean;
 }
 
+export interface MyProfileData {
+  displayName: string;
+  email: string;
+  role: Role;
+  canManageNetwork: boolean;
+  callingPhone: string;
+  whatsappPhone: string;
+  region: string;
+  defaultMemberFee?: number;
+  defaultSubstitutePayout?: number;
+  homeArea: string;
+  availability?: 'AVAILABLE' | 'LIMITED' | 'UNAVAILABLE';
+  emergencyConsent?: boolean;
+  emergencyContactName: string;
+  emergencyContactPhone: string;
+  upiReference: string;
+}
+
 export interface AdminBootstrapData {
   actor: SessionUser;
+  myProfile: MyProfileData;
   today: string;
   tomorrow: string;
   coordinators: Coordinator[];
@@ -133,9 +169,9 @@ export interface ConfirmedBriefingItem {
   reportingTime: string;
   startTime: string;
   endTime: string;
-  memberName: string;
-  memberBusiness: string;
   intro30Sec: string;
+  memberNoteType?: MemberNoteType;
+  referralAsk?: string;
   specialInstructions: string;
   coordinatorName: string;
   assignedViaCoordinatorId: string;
@@ -156,6 +192,7 @@ export interface ViaCoordinatorSummaryItem {
 
 export interface SubstituteBootstrapData {
   actor: SessionUser;
+  myProfile: MyProfileData;
   today: string;
   tomorrow: string;
   substituteProfile?: Substitute;
@@ -183,11 +220,8 @@ export type BootstrapPayload = AdminBootstrapData | SubstituteBootstrapData;
 
 export const api = {
   getAuthStatus: () => requestJson<AuthStatusResponse>('/api/auth/status'),
-  bootstrapAdmin: (body: { email: string; password: string; displayName: string; callingPhone: string }) =>
-    requestJson<{ token: string; user: SessionUser }>('/api/auth/bootstrap-admin', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
+  getLoginQuickFillAccounts: () =>
+    requestJson<{ accounts: LoginQuickFillAccount[] }>('/api/auth/login-accounts'),
   login: (email: string, password: string) =>
     requestJson<{ token: string; user: SessionUser }>('/api/auth/login', {
       method: 'POST',
@@ -199,7 +233,7 @@ export const api = {
       body: JSON.stringify({ roleKey }),
     }),
   forgotPassword: (email: string) =>
-    requestJson<{ resetToken?: string; message: string }>('/api/auth/forgot-password', {
+    requestJson<{ message: string }>('/api/auth/forgot-password', {
       method: 'POST',
       body: JSON.stringify({ email }),
     }),
@@ -214,6 +248,16 @@ export const api = {
       body: JSON.stringify({ email, inviteToken, password }),
     }),
   logout: () => requestJson<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    requestJson<{ ok: boolean }>('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword, newPassword }),
+    }),
+  updateMyProfile: (body: Partial<MyProfileData>) =>
+    requestJson<{ user: SessionUser; profile: MyProfileData }>('/api/me/profile', {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
   getBootstrap: () => requestJson<BootstrapPayload>('/api/bootstrap'),
   resetDemo: () => requestJson<BootstrapPayload>('/api/demo/reset', { method: 'POST' }),
   clearTestingTransactions: () =>
@@ -244,6 +288,11 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ active }),
     }),
+  setUserShowOnLogin: (userId: string, showOnLogin: boolean) =>
+    requestJson<{ ok: boolean }>(`/api/users/${encodeURIComponent(userId)}/show-on-login`, {
+      method: 'PATCH',
+      body: JSON.stringify({ showOnLogin }),
+    }),
 
   upsertLocation: (body: Record<string, unknown>) =>
     requestJson<Location>('/api/locations', { method: 'POST', body: JSON.stringify(body) }),
@@ -272,8 +321,18 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ reason }),
     }),
+  updateRequestReferralAsk: (requestId: string, referralAsk: string, memberNoteType?: MemberNoteType) =>
+    requestJson<MeetingRequest>(`/api/requests/${encodeURIComponent(requestId)}/referral-ask`, {
+      method: 'PATCH',
+      body: JSON.stringify({ referralAsk, memberNoteType }),
+    }),
   submitResponse: (requestId: string, body: Record<string, unknown>) =>
-    requestJson<{ response: RequestResponse; assignment?: Assignment; autoConfirmed: boolean }>(
+    requestJson<{
+      response: RequestResponse;
+      assignment?: Assignment;
+      autoConfirmed: boolean;
+      crossMeetingPending?: boolean;
+    }>(
       `/api/requests/${encodeURIComponent(requestId)}/respond`,
       { method: 'POST', body: JSON.stringify(body) }
     ),
@@ -315,6 +374,11 @@ export const api = {
     requestJson<Assignment>(`/api/assignments/${encodeURIComponent(assignmentId)}/checkin`, {
       method: 'POST',
       body: JSON.stringify({ eventType, note }),
+    }),
+  reportAssignmentIssue: (assignmentId: string, note: string) =>
+    requestJson<Assignment>(`/api/assignments/${encodeURIComponent(assignmentId)}/issue`, {
+      method: 'POST',
+      body: JSON.stringify({ note }),
     }),
   finishAssignment: (assignmentId: string, body: Record<string, unknown>) =>
     requestJson<{

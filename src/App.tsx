@@ -8,7 +8,7 @@ import {
   type BootstrapPayload,
   type SubstituteBootstrapData,
 } from './lib/api';
-import type { SessionUser } from './core/types';
+import type { NotificationItem, SessionUser } from './core/types';
 import { LoginView } from './components/LoginView';
 import { AppShell, type AdminTab, type SubTab } from './components/AppShell';
 import { OverviewHome } from './components/OverviewHome';
@@ -18,7 +18,12 @@ import { FinanceView } from './components/FinanceView';
 import { ReportsView } from './components/ReportsView';
 import { SubstitutePortal } from './components/SubstitutePortal';
 import { WhatsAppModal, type DraftMessageConfig } from './components/WhatsAppModal';
-import { SettingsDrawer } from './components/SettingsDrawer';
+import {
+  SettingsDrawer,
+  type NextMeetingSummary,
+  type TomorrowBriefingSummary,
+} from './components/SettingsDrawer';
+import { formatShortDate, resolveNotificationDestination } from './core/rules';
 
 export interface RequestsFilterIntent {
   chapterId?: string;
@@ -53,6 +58,8 @@ export default function App() {
   });
   const [openCreateRequest, setOpenCreateRequest] = useState(false);
   const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
+  const [focusedSubOpenRequestId, setFocusedSubOpenRequestId] = useState<string | null>(null);
+  const [focusedSubAssignmentId, setFocusedSubAssignmentId] = useState<string | null>(null);
   const [requestsFilterIntent, setRequestsFilterIntent] = useState<RequestsFilterIntent | null>(() => {
     const p = new URLSearchParams(window.location.search);
     const chapterId = p.get('chapter') || undefined;
@@ -78,6 +85,28 @@ export default function App() {
   });
   const [draftModal, setDraftModal] = useState<DraftMessageConfig | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    try {
+      const saved = window.localStorage.getItem('agencyos_theme');
+      if (saved === 'light' || saved === 'dark') return saved;
+    } catch {
+      // ignore storage errors
+    }
+    return 'dark';
+  });
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    try {
+      window.localStorage.setItem('agencyos_theme', theme);
+    } catch {
+      // ignore storage errors
+    }
+  }, [theme]);
+
+  const handleToggleTheme = useCallback(() => {
+    setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
+  }, []);
 
   const syncUrlParams = useCallback((updates: Record<string, string | undefined>) => {
     try {
@@ -211,12 +240,56 @@ export default function App() {
     }
   }
 
-  async function handleMarkNotifRead(id: string) {
-    try {
-      await api.markNotificationRead(id);
-      await loadBootstrap();
-    } catch {
-      // ignore
+  async function handleSelectNotification(notification: NotificationItem) {
+    if (!data) return;
+
+    const destination = isSubData(data)
+      ? resolveNotificationDestination(notification, data.actor.role, {
+          openRequests: data.openRequests,
+          assignments: data.myAssignments,
+        })
+      : resolveNotificationDestination(notification, data.actor.role, {
+          requests: data.requests,
+          assignments: data.assignments,
+        });
+
+    // Navigate directly to the destination view & entity
+    if (isSubData(data)) {
+      if (destination.tab === 'open') {
+        setFocusedSubOpenRequestId(destination.openRequestId ?? null);
+        handleSelectTab('open');
+      } else if (destination.tab === 'meetings') {
+        setFocusedSubAssignmentId(destination.assignmentId ?? null);
+        handleSelectTab('meetings');
+      } else {
+        handleSelectTab(destination.tab);
+      }
+    } else {
+      if (destination.tab === 'requests') {
+        if (destination.requestId) {
+          setSelectedRequestId(destination.requestId);
+        }
+        handleDrillToRequests({
+          status: destination.requestStatus ?? 'ALL',
+        });
+      } else if (destination.tab === 'finance') {
+        handleDrillToFinance({
+          tab: destination.financeTab ?? 'receipts',
+          status: 'ALL',
+        });
+      } else {
+        handleSelectTab(destination.tab);
+      }
+    }
+
+    // Mark read in the background and refresh state
+    if (!notification.read) {
+      try {
+        await api.markNotificationRead(notification.id);
+        await loadBootstrap();
+      } catch {
+        // ignore transient network error
+      }
     }
   }
 
@@ -226,28 +299,41 @@ export default function App() {
 
   if (loading && !data) {
     return (
-      <div className="min-h-screen bg-white flex flex-col items-center justify-center p-6 text-center">
-        <img
-          src="/assets/aistudio/image__1__81460661.png"
-          alt="AgencyOS"
-          className="h-12 w-auto object-contain mb-4 opacity-90"
-        />
-        <p className="font-display text-sm font-bold text-[#142342]">Loading AgencyOS workspace...</p>
-        <p className="text-xs text-[#64748B] mt-1">Verifying server-scoped permissions</p>
+      <div className="min-h-screen bg-[#111113] flex flex-col items-center justify-center p-6 text-center">
+        <div className="inline-flex items-center gap-3 mb-4">
+          <img
+            src="/assets/aistudio/image__1__81460661.png"
+            alt="Veloctive emblem"
+            referrerPolicy="no-referrer"
+            className="h-11 w-auto object-contain opacity-95"
+          />
+          <div className="flex flex-col items-start leading-none">
+            <span className="font-editorial text-2xl font-bold tracking-[-0.03em] text-[#f2efeb]">
+              Agency<span className="text-[#E2B340]">OS</span>
+            </span>
+            <span className="font-editorial italic text-xs font-medium text-[#E2B340] mt-0.5">
+              by Kishan
+            </span>
+          </div>
+        </div>
+        <p className="font-display text-sm font-bold text-[#f2efeb] tracking-tight">Loading workspace...</p>
+        <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-[#f2efeb]/60 mt-1.5">
+          Verifying server-scoped permissions
+        </p>
       </div>
     );
   }
 
   if (error && !data) {
     return (
-      <div className="min-h-screen bg-white flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto">
-        <p className="font-display text-base font-bold text-red-700">Connection or Authorization Error</p>
-        <p className="text-xs text-[#475569] mt-2">{error}</p>
+      <div className="min-h-screen bg-[#111113] flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto">
+        <p className="font-display text-base font-bold text-red-400">Connection or Authorization Error</p>
+        <p className="text-xs text-[#f2efeb]/70 mt-2">{error}</p>
         <div className="flex gap-2 mt-4">
           <button
             type="button"
             onClick={loadBootstrap}
-            className="h-10 px-4 rounded-xl bg-[#6D28D9] text-white text-xs font-semibold inline-flex items-center gap-1.5"
+            className="h-10 px-4 rounded-[4px] bg-[#C81E2B] hover:bg-[#A31621] text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
           >
             <RefreshCw className="w-3.5 h-3.5" />
             Retry
@@ -255,7 +341,7 @@ export default function App() {
           <button
             type="button"
             onClick={handleLogout}
-            className="h-10 px-4 rounded-xl border border-[#E6E8EF] text-xs font-semibold text-[#142342]"
+            className="h-10 px-4 rounded-[4px] border border-[#f2efeb]/15 hover:bg-white/5 text-xs font-semibold text-[#f2efeb] cursor-pointer"
           >
             Back to Sign In
           </button>
@@ -277,10 +363,12 @@ export default function App() {
         activeTab={activeTab}
         onSelectTab={handleSelectTab}
         notifications={data.notifications}
-        onMarkNotificationRead={handleMarkNotifRead}
+        onSelectNotification={handleSelectNotification}
         onLogout={handleLogout}
         onResetDemo={isSuperAdmin && data.actor.namespace === 'demo' ? handleResetDemo : undefined}
         onOpenSettings={() => setSettingsOpen(true)}
+        theme={theme}
+        onToggleTheme={handleToggleTheme}
       >
         {isSub ? (
           <SubstitutePortal
@@ -288,6 +376,12 @@ export default function App() {
             activeTab={activeTab as SubTab}
             onSelectTab={(t) => handleSelectTab(t)}
             onRefresh={loadBootstrap}
+            focusedOpenRequestId={focusedSubOpenRequestId}
+            focusedAssignmentId={focusedSubAssignmentId}
+            onClearFocus={() => {
+              setFocusedSubOpenRequestId(null);
+              setFocusedSubAssignmentId(null);
+            }}
           />
         ) : (
           adminData && (
@@ -308,6 +402,14 @@ export default function App() {
                   onDrillToFinance={handleDrillToFinance}
                   onVerifyAssignment={async (asgnId) => {
                     await api.verifyAssignment(asgnId);
+                    await loadBootstrap();
+                  }}
+                  onApproveResponse={async (responseId) => {
+                    await api.approveResponse(responseId);
+                    await loadBootstrap();
+                  }}
+                  onRejectResponse={async (responseId, reason) => {
+                    await api.rejectResponse(responseId, reason);
                     await loadBootstrap();
                   }}
                 />
@@ -361,7 +463,85 @@ export default function App() {
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         user={data.actor}
+        myProfile={data.myProfile}
         auditEvents={adminData?.auditEvents}
+        tomorrowBriefing={
+          adminData
+            ? ((): TomorrowBriefingSummary => {
+                const tmrwReqs = adminData.requests.filter(
+                  (r) => r.meetingDate === adminData.tomorrow && r.status !== 'CANCELLED'
+                );
+                let confirmed = 0;
+                let unfilled = 0;
+                const lines = tmrwReqs.map((r) => {
+                  const activeAsgns = adminData.assignments.filter(
+                    (a) => a.requestId === r.id && !['CANCELLED', 'REPLACED', 'NO_SHOW'].includes(a.status)
+                  );
+                  if (activeAsgns.length >= r.positionsRequired) confirmed += 1;
+                  else unfilled += 1;
+                  const attendees =
+                    activeAsgns.length > 0
+                      ? activeAsgns.map((a) => a.actualAttendeeName).join(', ')
+                      : 'Unassigned';
+                  return `• #${r.requestNumber} ${r.chapterNameSnapshot} (${r.reportingTime}) — ${r.memberNameSnapshot} · Attendee: ${attendees}`;
+                });
+                const dateLabel = formatShortDate(adminData.tomorrow);
+                const briefingText = [
+                  `AgencyOS Briefing — ${dateLabel}`,
+                  `Total: ${tmrwReqs.length} | Confirmed: ${confirmed} | Unfilled: ${unfilled}`,
+                  '',
+                  ...lines,
+                ].join('\n');
+                return {
+                  dateLabel,
+                  total: tmrwReqs.length,
+                  confirmed,
+                  unfilled,
+                  briefingText,
+                };
+              })()
+            : undefined
+        }
+        nextMeeting={
+          isSub
+            ? ((): NextMeetingSummary | null => {
+                const activeBriefings = data.confirmedBriefings
+                  .filter(
+                    (b) =>
+                      !['CANCELLED', 'REPLACED', 'NO_SHOW', 'VERIFIED', 'COMPLETED_SELF_REPORTED'].includes(
+                        b.assignment.status
+                      )
+                  )
+                  .sort((a, b) => a.assignment.meetingDate.localeCompare(b.assignment.meetingDate));
+                const upcoming =
+                  activeBriefings.find((b) => b.assignment.meetingDate >= data.today) ?? activeBriefings[0];
+                if (!upcoming) return null;
+                return {
+                  label: `${upcoming.chapterName} · ${formatShortDate(upcoming.assignment.meetingDate)}`,
+                  sublabel: `${upcoming.reportingTime} · ${upcoming.venueName}`,
+                  copyText: [
+                    `Meeting: ${upcoming.chapterName} (${formatShortDate(upcoming.assignment.meetingDate)})`,
+                    `Reporting: ${upcoming.reportingTime} | Venue: ${upcoming.venueName}, ${upcoming.area}`,
+                    upcoming.address ? `Address: ${upcoming.address}` : '',
+                    upcoming.specialInstructions ? `Instructions: ${upcoming.specialInstructions}` : '',
+                    `Coordinator: ${upcoming.coordinatorName}`,
+                    upcoming.mapsUrl ? `Maps: ${upcoming.mapsUrl}` : '',
+                  ]
+                    .filter(Boolean)
+                    .join('\n'),
+                };
+              })()
+            : null
+        }
+        onProfileUpdated={loadBootstrap}
+        onQuickCreateRequest={
+          !isSub
+            ? () => {
+                setOpenCreateRequest(true);
+                handleSelectTab('requests');
+              }
+            : undefined
+        }
         onLogout={handleLogout}
         onResetDemo={isSuperAdmin && data.actor.namespace === 'demo' ? handleResetDemo : undefined}
         onClearTransactions={isSuperAdmin ? handleClearTestingTransactions : undefined}
